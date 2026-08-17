@@ -364,10 +364,26 @@ typedef struct _mp_obj_quickjs_context_t {
  * 调用约定：凡是在执行期间可能回调 Python（CClosure -> ctx.close()）的
  * 入口，都必须以 enter 开始、并在所有路径（含 NLR 异常）上 leave 结束。
  */
+/* 见 quickjs_reap_dead_callbacks 定义（struct 定义之后）。 */
+static void quickjs_reap_dead_callbacks(
+    quickjs_ctx_t *state
+);
+
+
 static void quickjs_ctx_enter(
     quickjs_ctx_t *state
 ) {
     if (state != NULL) {
+
+        /*
+         * 阶段 10（OOM/生命周期审计修复）：
+         * 回收已被 JS GC 销毁的 handler 闭包节点。最终化回调只打
+         * dead 标记、绝不 free（保持 close/覆盖路径的无 UAF 排序），
+         * 由这里统一 unlink + m_del —— 高频 promise handler churn
+         * 不再把 callback 节点累积到 ctx.close()（实测每闭包 96 B）。
+         */
+        quickjs_reap_dead_callbacks(state);
+
         state->executing_depth++;
     }
 }
@@ -1430,6 +1446,45 @@ static mp_obj_t quickjs_promise_to_mp(
 }
 
 
+/*
+ * 阶段 10（OOM 审计修复）：把 owned 的 JS promise 包装成 Python wrapper。
+ *
+ * quickjs_promise_to_mp 内部做 MP 分配（wrapper 对象 + 条目表），可能
+ * 因内存不足抛 MemoryError；若任其穿透，调用方持有的 q（owned JSValue）
+ * 会在 JS_FreeValue(q) 之前被 nlr 跳过而永久泄漏（promise refcount > 0
+ * 且无外部引用，JS GC 无法回收）。
+ *
+ * 本辅助函数保证：无论成功/失败，q 恰好被释放一次。
+ */
+static mp_obj_t quickjs_promise_wrap_owned(
+    JSContext *ctx,
+    JSValue q
+) {
+    nlr_buf_t nlr;
+
+    if (nlr_push(&nlr) == 0) {
+
+        mp_obj_t w =
+            quickjs_promise_to_mp(
+                ctx,
+                q
+            );
+
+        nlr_pop();
+
+        JS_FreeValue(ctx, q);
+
+        return w;
+    }
+
+    JS_FreeValue(ctx, q);
+
+    nlr_raise(nlr.ret_val);
+
+    return mp_const_none; /* unreachable */
+}
+
+
 /* -------------------------------------------------------------------------- */
 /* 阶段 7：ctx.promise() 的 resolve/reject wrapper                              */
 /* -------------------------------------------------------------------------- */
@@ -1915,6 +1970,8 @@ struct _quickjs_callback_t {
     JSValue js_func;    /* 注册表持有的 CClosure 引用 */
 
     bool opaque_active; /* CClosure 的 opaque 仍指向本节点 */
+    bool dead;          /* 闭包已被 JS GC 销毁（opaque 不再安全）；
+                          由 quickjs_ctx_enter 的 reap 统一 unlink+m_del */
 };
 
 
@@ -1927,6 +1984,7 @@ static void quickjs_cb_finalize(
     if (node != NULL) {
 
         node->opaque_active = false;
+        node->dead = true;
     }
 }
 
@@ -2141,6 +2199,47 @@ static void quickjs_callback_free_node(
         node,
         1
     );
+}
+
+
+/*
+ * 阶段 10（OOM/生命周期审计修复）：
+ * 统一回收被 JS GC 销毁的闭包节点（dead==true）。
+ *
+ * 安全论证：
+ *   - dead 节点 = 对应 CClosure 已被引擎销毁且 finalizer
+ *     （quickjs_cb_finalize）已经执行完毕；此后没有任何代码
+ *     会再触碰节点的 opaque 指针，unlink + m_del 无 UAF。
+ *   - 执行中的回调节点不是 dead（其闭包必存活）。
+ *   - close() 路径先 JS_FreeContext（触发全部 finalizer -> dead），
+ *     后按链表释放节点：这里回收过的节点已不在链表中，
+ *     不会被 close 双重释放。
+ *   - 覆盖注册（add_callable 同名）路径在 JS_FreeValue(js_func)
+ *     之后 free_node：若节点已被本函数回收则链表已无它，
+ *     直接 free 任意顺序都安全（free_node 内已置空所有字段）。
+ */
+static void quickjs_reap_dead_callbacks(
+    quickjs_ctx_t *state
+) {
+    quickjs_callback_t **pp =
+        &state->callbacks;
+
+    while (*pp != NULL) {
+
+        quickjs_callback_t *node =
+            *pp;
+
+        if (node->dead) {
+
+            *pp = node->next;
+
+            quickjs_callback_free_node(node);
+
+        } else {
+
+            pp = &node->next;
+        }
+    }
 }
 
 
@@ -3294,18 +3393,43 @@ static mp_obj_t quickjs_string_to_mp(
         );
     }
 
-    mp_obj_t result =
-        mp_obj_new_str(
-            str,
-            len
+    /*
+     * 阶段 10（OOM 审计修复）：mp_obj_new_str 复制字节，可能因 MP
+     * 内存不足抛 MemoryError。若不在 nlr 内先释放 str，JS_ToCStringLen
+     * 留下的字符串引用会永久泄漏（rope 情形额外泄漏整个扁平化副本；
+     * 实测 js_mem 增长 39 KB）。用 nlr 保护，异常路径先 JS_FreeCString
+     * 再重抛（与 quickjs_typedarray_to_mp 同一模式）。
+     */
+    nlr_buf_t nlr;
+
+    if (nlr_push(&nlr) == 0) {
+
+        mp_obj_t result =
+            mp_obj_new_str(
+                str,
+                len
+            );
+
+        nlr_pop();
+
+        JS_FreeCString(
+            ctx,
+            str
         );
 
-    JS_FreeCString(
-        ctx,
-        str
-    );
+        return result;
 
-    return result;
+    } else {
+
+        JS_FreeCString(
+            ctx,
+            str
+        );
+
+        nlr_raise(nlr.ret_val);
+    }
+
+    return mp_const_none; /* unreachable */
 }
 
 
@@ -3508,11 +3632,7 @@ static mp_obj_t quickjs_object_to_mp(
     }
 
 
-    mp_obj_t result =
-        mp_obj_new_dict(
-            prop_count
-        );
-
+    mp_obj_t result = MP_OBJ_NULL;
 
     bool pushed = false;
 
@@ -3524,6 +3644,17 @@ static mp_obj_t quickjs_object_to_mp(
     nlr_buf_t outer;
 
     if (nlr_push(&outer) == 0) {
+
+        /*
+         * 阶段 10（OOM 审计修复）：mp_obj_new_dict 必须在 nlr 保护内
+         * 分配。否则它因 MP 内存不足抛 MemoryError 时，props
+         * （JSPropertyEnum 数组 + 每个属性的 atom 引用）会绕过
+         * JS_FreePropertyEnum 而永久泄漏（LSan 实测 4.6 MB）。
+         */
+        result =
+            mp_obj_new_dict(
+                prop_count
+            );
 
         quickjs_convert_push_mp(
             st,
@@ -5138,15 +5269,10 @@ static mp_obj_t mod_quickjs_promise_then(
         }
 
         mp_obj_t w =
-            quickjs_promise_to_mp(
+            quickjs_promise_wrap_owned(
                 qctx,
                 q
             );
-
-        JS_FreeValue(
-            qctx,
-            q
-        );
 
         nlr_pop();
 
@@ -5269,15 +5395,10 @@ static mp_obj_t mod_quickjs_promise_catch(
         }
 
         mp_obj_t w =
-            quickjs_promise_to_mp(
+            quickjs_promise_wrap_owned(
                 qctx,
                 q
             );
-
-        JS_FreeValue(
-            qctx,
-            q
-        );
 
         nlr_pop();
 
@@ -5411,6 +5532,7 @@ static mp_obj_t mod_quickjs_promise_finally(
                 &fh
             );
 
+
         bool timed_out =
             quickjs_ctx_finish_timeout(state);
 
@@ -5434,15 +5556,10 @@ static mp_obj_t mod_quickjs_promise_finally(
         }
 
         mp_obj_t w =
-            quickjs_promise_to_mp(
+            quickjs_promise_wrap_owned(
                 qctx,
                 q
             );
-
-        JS_FreeValue(
-            qctx,
-            q
-        );
 
         nlr_pop();
 
@@ -6097,11 +6214,32 @@ static mp_obj_t quickjs_call_value_helper_this(
 
     if (n > 0) {
 
-        argv =
-            m_new(
-                JSValue,
-                n
+        /*
+         * 阶段 10（OOM 审计修复）：argv（m_new 分配）失败时 this_val
+         * 仍是本函数拥有的 JSValue，必须释放后再重抛，否则 this_val
+         * 引用跨过 JSRuntime 生命周期泄漏（DEBUG assert / LSan 可观测）。
+         */
+        nlr_buf_t nlr_argv;
+
+        if (nlr_push(&nlr_argv) == 0) {
+
+            argv =
+                m_new(
+                    JSValue,
+                    n
+                );
+
+            nlr_pop();
+
+        } else {
+
+            JS_FreeValue(
+                qctx,
+                this_val
             );
+
+            nlr_raise(nlr_argv.ret_val);
+        }
     }
 
 
@@ -7403,7 +7541,21 @@ static mp_obj_t mod_quickjs_ctx_promise(
 
         quickjs_ctx_arm_timeout(state);
 
-        JSValue resolving_funcs[2];
+        /*
+         * 阶段 10（OOM 审计修复）：必须显式初始化。
+         *
+         * js_promise_new()（quickjs.c:55919）在更早的失败点
+         * （js_create_from_ctor 的 js_malloc、JSPromiseData 的
+         * js_mallocz）直接返回 JS_EXCEPTION，根本不写 resolving_funcs
+         * （只有 js_create_resolving_functions 失败时才会把两个槽写成
+         * JS_UNDEFINED）。若不初始化，下面 JS_IsException(promise) 的
+         * 失败路径会对未初始化的栈值执行 JS_FreeValue —— 未初始化读取
+         * + 释放随机垃圾的 UB。
+         */
+        JSValue resolving_funcs[2] = {
+            JS_UNDEFINED,
+            JS_UNDEFINED
+        };
 
         JSValue promise =
             JS_NewPromiseCapability(

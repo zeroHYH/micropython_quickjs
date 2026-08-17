@@ -596,7 +596,25 @@ micropython tests/test_quickjs_phase6.py   # execution safety: nested timeout bu
 micropython tests/test_quickjs_phase7.py   # python-side promise creation/control (ctx.promise)
 micropython tests/test_quickjs_phase8.py   # async/await execution model (native, no engine changes)
 micropython tests/test_quickjs_phase9.py   # unhandled rejection diagnostics (set_unhandled_rejection_handler)
+micropython tests/test_quickjs_phase10.py  # final ownership/lifecycle audit + stress (GC-order attacks, close-busy
+                                           # contract, timeout/OOM combos, 10000x stress; regressions for the
+                                           # OOM-path fixes: promise resolve funcs init, JSPropertyEnum props
+                                           # leak, JS_FreeCString on MP OOM, handler-closure node reaping)
 ```
+
+Phase 10 notes:
+
+- The JS heap of each context has a hard cap: `QUICKJS_DEFAULT_MEMORY_LIMIT`
+  (default 128 KiB for MCU parity; the Make-style Unix port overrides it to
+  8 MiB via `-DQUICKJS_DEFAULT_MEMORY_LIMIT=8388608`).  Exhausting the cap is
+  intended device protection; the engine's OOM fallback then throws a JS
+  `null` value (see `JS_ThrowError2` in the vendored QuickJS), which the
+  module surfaces as `RuntimeError('null')` instead of a descriptive
+  "out of memory" — an engine-side ambiguity between "heap limit hit" and
+  `throw null`, documented as a known limitation.
+- LSan baselines (open-context-at-exit user behaviour, unchanged):
+  phase1 ≈ 107 KB, phase3 ≈ 103 KB, phase4 ≈ 816 KB (from leaked contexts
+  those suites intentionally leave open).
 
 ## Layout
 
