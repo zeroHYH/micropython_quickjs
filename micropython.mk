@@ -7,6 +7,15 @@
 
 QJS_MOD_DIR := $(USERMOD_DIR)
 
+# QuickJS-NG engine is fetched from GitHub, not vendored (see get_quickjs.sh).
+# If it is not present yet, fetch it now (network required once).  Output is
+# redirected so the fetch script's messages cannot corrupt the Makefile.
+_QJS_HEADER := $(QJS_MOD_DIR)/src/quickjs.h
+ifeq ($(wildcard $(_QJS_HEADER)),)
+$(info [quickjs] QuickJS-NG not found; running get_quickjs.sh ...)
+$(shell cd $(QJS_MOD_DIR) && ./get_quickjs.sh >/dev/null 2>&1)
+endif
+
 # Python-facing module code (scanned for QSTRs / mp module definitions).
 SRC_USERMOD_C += \
     $(QJS_MOD_DIR)/modquickjs.c

@@ -1,5 +1,21 @@
 add_library(usermod_quickjs INTERFACE)
 
+# QuickJS-NG engine is fetched from GitHub, not vendored (see get_quickjs.sh).
+# If it is not present yet, fetch it now at configure time (network once).
+if(NOT EXISTS ${CMAKE_CURRENT_LIST_DIR}/src/quickjs.h)
+    message(STATUS "[quickjs] QuickJS-NG not found; running get_quickjs.sh ...")
+    execute_process(
+        COMMAND sh ${CMAKE_CURRENT_LIST_DIR}/get_quickjs.sh
+        WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
+        RESULT_VARIABLE QJS_FETCH_RESULT
+        OUTPUT_QUIET
+    )
+    if(NOT QJS_FETCH_RESULT EQUAL 0)
+        message(FATAL_ERROR
+            "[quickjs] failed to fetch QuickJS-NG; run get_quickjs.sh manually")
+    endif()
+endif()
+
 target_sources(usermod_quickjs INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/modquickjs.c
     ${CMAKE_CURRENT_LIST_DIR}/src/quickjs.c

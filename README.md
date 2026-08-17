@@ -8,6 +8,15 @@ JavaScript engine (vendored under `src/`, v0.16.1).
 
 ## Build
 
+The QuickJS-NG engine is **not stored in this repository** — it is fetched
+from GitHub on first build (see `get_quickjs.sh`).  The Make and CMake
+build files fetch it automatically when `src/quickjs.h` is missing, so you
+typically do not need to do anything; the first build needs network access.
+
+```sh
+./get_quickjs.sh        # optional: fetch manually
+```
+
 ### Make-based ports (unix, stm32, esp8266, nrf, ...)
 
 ```sh
@@ -20,7 +29,17 @@ make -j$(nproc) USER_C_MODULES=/path/to/micropython_quickjs MICROPY_PY_FFI=0
 ### CMake-based ports (esp32, rp2, ...)
 
 Pass the module directory through `USER_C_MODULES` on the CMake command line
-(the project already ships `micropython.cmake`).
+(the project already ships `micropython.cmake`; it fetches QuickJS at
+configure time).
+
+### Choosing the QuickJS snapshot
+
+By default the **latest** QuickJS-NG (default branch) is used.  To pin to a
+specific tag or commit, re-fetch with `QJS_REF`:
+
+```sh
+QJS_REF=v0.16.1 ./get_quickjs.sh
+```
 
 > The default QuickJS heap limit is 64 KiB (matching the original ESP32
 > build). On 64-bit hosts QuickJS-NG needs more than 64 KiB just to create a
@@ -203,11 +222,12 @@ micropython tests/test_quickjs_phase3.py   # function bridge + timeout
 ## Layout
 
 ```
-micropython.cmake     CMake-based ports (esp32, rp2)
-micropython.mk        Make-based ports (unix, stm32, ...)
+micropython.cmake     CMake-based ports (esp32, rp2) — auto-fetches QuickJS
+micropython.mk        Make-based ports (unix, stm32, ...) — auto-fetches QuickJS
+get_quickjs.sh        fetch the QuickJS-NG engine into src/ (from GitHub)
 modquickjs.c          the module implementation
-src/                  vendored QuickJS-NG (v0.16.1, unmodified)
 tests/                Python test suites
+src/                  generated: QuickJS-NG fetched from GitHub (git-ignored)
 ```
 
 ## License
