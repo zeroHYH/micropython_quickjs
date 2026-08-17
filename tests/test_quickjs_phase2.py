@@ -243,20 +243,22 @@ except TypeError as e:
 print("Symbol unsupported OK")
 
 # =============================================================
-# 19. Function unsupported in conversion (phase 3 will add wrapper)
+# 19. Function conversion (phase 3: returns a Python callable wrapper)
 # =============================================================
 ctx.eval("function someFunction(){ return 1; }")
+f = ctx.get("someFunction")
+assert callable(f)
+assert f() == 1
+# anonymous function in eval result also wraps
+assert ctx.eval("(function(){ return 1; })")() == 1
+# singleton has no Context opaque -> still unsupported (phase 2 behavior)
 try:
-    ctx.get("someFunction")
+    quickjs.eval("function singletonFn(){ return 1; }")
+    quickjs.eval("singletonFn")
     raise AssertionError("expected TypeError")
 except TypeError as e:
     assert "unsupported" in str(e), str(e)
-try:
-    ctx.eval("(function(){ return 1; })")
-    raise AssertionError("expected TypeError")
-except TypeError as e:
-    assert "unsupported" in str(e), str(e)
-print("Function unsupported OK")
+print("Function wrapper OK")
 
 # =============================================================
 # 20. JS Error name/message

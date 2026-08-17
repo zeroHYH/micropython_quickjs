@@ -66,6 +66,65 @@ but never rely on it alone.
 
 After `close()`, every Context method raises `RuntimeError("context closed")`.
 
+### JS Function <-> MicroPython callable
+
+```python
+ctx.eval("function add(a,b){ return a+b; }")
+add = ctx.get("add")           # JS function -> Python callable wrapper
+assert callable(add)
+assert add(1, 2) == 3
+```
+
+The wrapper keeps its `Context` alive (strong reference), so it never dangles.
+After `ctx.close()` the wrapper raises `RuntimeError("context closed")`.
+Keyword arguments are rejected with `TypeError`.
+
+```python
+def multiply(a, b):
+    return a * b
+ctx.add_callable("multiply", multiply)   # Python callable -> JS function
+assert ctx.eval("multiply(6, 7)") == 42
+```
+
+Python callables registered this way are kept alive by a per-Context
+callback registry (GC-rooted, no `static mp_obj_t`). The registered
+callable is called through a `JS_NewCClosure` bridge; a Python exception
+raised inside the callback is caught (never crosses the QuickJS C stack)
+and re-thrown as a JS error, then mapped back to MicroPython:
+
+```python
+def fail():
+    raise ValueError("callback failure")
+ctx.add_callable("fail", fail)
+try:
+    ctx.eval("fail()")
+except Exception as e:
+    print(e)   # TypeError: ValueError: callback failure
+```
+
+JS code can also `try/catch` the error. Registering the same name twice
+replaces the previous callable.
+
+### Execution timeout
+
+```python
+ctx.set_time_limit(100)          # ms; 0 disables; negative -> ValueError
+
+try:
+    ctx.eval("while (true) {}")
+except RuntimeError as e:
+    print(e)                     # JavaScript execution timeout
+
+ctx.set_time_limit(0)
+assert ctx.eval("1 + 2") == 3   # context is reusable after a timeout
+```
+
+The timeout covers `eval`, `call`, and function-wrapper calls. It is
+implemented with `JS_SetInterruptHandler` + `mp_hal_ticks_ms()`; the
+interrupt handler only reads the clock and sets a flag (no MicroPython
+API calls, no GC). The timeout state is per-execution and never poisons
+the Context.
+
 ## Type conversions
 
 | MicroPython | JS |
@@ -79,6 +138,7 @@ After `close()`, every Context method raises `RuntimeError("context closed")`.
 | `dict` | `Object` (string keys only) |
 | `bytes` | `ArrayBuffer` |
 | `bytearray` | `Uint8Array` |
+| Python callable | `Function` (via `add_callable`) |
 
 | JS | MicroPython |
 |---|---|
@@ -91,6 +151,7 @@ After `close()`, every Context method raises `RuntimeError("context closed")`.
 | `ArrayBuffer` | `bytes` |
 | `Uint8Array` | `bytes` |
 | `BigInt` (int64 range) | `int` |
+| `Function` | Python callable wrapper |
 
 `bytes` / `ArrayBuffer` / `bytearray` / `Uint8Array` conversions are **copy
 semantics** — no borrowed pointers in either direction, so the Python object
@@ -98,15 +159,14 @@ and the JS value never alias.
 
 ### Not supported (yet)
 
-- JS Function -> Python callable wrapper / Python callable -> JS function
-  (planned for a later phase)
-- TypedArrays other than `Uint8Array` (`Uint16Array`, `Int8Array`,
-  `Float32Array`, ...) -> raises `TypeError: unsupported typed array`
+- Promise / async bridging
+- JS `this` binding for wrappers (calls pass `JS_UNDEFINED`)
+- `Uint8Array` is the only supported TypedArray; others raise
+  `TypeError: unsupported typed array`
 - `Symbol` -> raises `TypeError`
 - `BigInt` outside int64 range -> raises `TypeError: BigInt out of range`
   (never silently converted to float or truncated)
 - Python `int` -> JS BigInt (Python ints stay int32/float64)
-- Promise / async bridging
 
 ### Exceptions
 
@@ -137,6 +197,7 @@ Run with the built unix `micropython` binary:
 micropython tests/test_quickjs_phase0.py   # baseline conversions + API
 micropython tests/test_quickjs_phase1.py   # Context lifecycle / GC
 micropython tests/test_quickjs_phase2.py   # depth/cycles, binary, BigInt, errors
+micropython tests/test_quickjs_phase3.py   # function bridge + timeout
 ```
 
 ## Layout
