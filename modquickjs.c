@@ -27,7 +27,7 @@
  * CMake 型 port（ESP32/RP2 等）不使用该宏，保持 64 KiB 不变。
  */
 #ifndef QUICKJS_DEFAULT_MEMORY_LIMIT
-#define QUICKJS_DEFAULT_MEMORY_LIMIT (64 * 1024)
+#define QUICKJS_DEFAULT_MEMORY_LIMIT (128 * 1024)
 #endif
 
 
@@ -292,6 +292,23 @@ typedef struct _quickjs_ctx_t {
      */
     struct _quickjs_value_entry_t *function_entries;
     struct _quickjs_value_entry_t *promise_entries;
+
+    /*
+     * 阶段 7：resolve/reject callable wrapper 的 JS 值条目表
+     * （token -> JSValue dup）。
+     *
+     * ctx.promise() 创建的 resolving function（JS_NewPromiseCapability
+     * 的 resolving_funcs[0]/[1]）由本表持有：wrapper（resolve/reject
+     * Python callable）只拿 token，dup 归 state 所有，生命周期与
+     * function_entries / promise_entries 完全一致（同上模型）：
+     *
+     *   - wrapper 被 MP GC 回收但不跑 __del__ 时，dup 不泄漏
+     *     （close() 统一释放整张表）；
+     *   - wrapper 正常 __del__ 时按 token 摘除条目并释放 dup；
+     *   - close() 释放整张表；close 后 wrapper 的 token 查不到条目
+     *     -> 统一 RuntimeError("context closed")。
+     */
+    struct _quickjs_value_entry_t *resolver_entries;
     uint32_t next_token;    /* 0 保留给“无 token”；单调递增，不复用 */
 } quickjs_ctx_t;
 
@@ -439,6 +456,24 @@ static quickjs_ctx_t *quickjs_ctx_check_open(
     mp_obj_t self_in
 );
 
+/*
+ * 超时窗口 / 异常抛出辅助的前向声明：
+ * 阶段 7 的 resolver 代码位于这些辅助的实现之前。
+ */
+static void quickjs_ctx_arm_timeout(
+    quickjs_ctx_t *state
+);
+
+static bool quickjs_ctx_finish_timeout(
+    quickjs_ctx_t *state
+);
+
+static void quickjs_raise_exception_state(
+    JSContext *ctx,
+    JSValue val,
+    bool timed_out
+);
+
 static void quickjs_raise_exception(
     JSContext *ctx,
     JSValue val
@@ -468,6 +503,22 @@ static mp_obj_t mod_quickjs_promise_result(
 );
 
 static mp_obj_t mod_quickjs_promise_del(
+    mp_obj_t self_in
+);
+
+/* 阶段 7：ctx.promise() 的 resolve/reject wrapper（见定义处注释） */
+static mp_obj_t mod_quickjs_resolver_call(
+    mp_obj_t self_in,
+    size_t n_args,
+    size_t n_kw,
+    const mp_obj_t *args
+);
+
+static mp_obj_t mod_quickjs_resolver_del(
+    mp_obj_t self_in
+);
+
+static mp_obj_t mod_quickjs_ctx_promise(
     mp_obj_t self_in
 );
 
@@ -806,6 +857,30 @@ static void quickjs_ctx_release_entries(
     }
 
     state->promise_entries = NULL;
+
+    /* 阶段 7：resolve/reject wrapper 条目（ctx.promise()） */
+    e = state->resolver_entries;
+
+    while (e != NULL) {
+
+        quickjs_value_entry_t *next =
+            e->next;
+
+        JS_FreeValue(
+            state->ctx,
+            e->val
+        );
+
+        m_del(
+            quickjs_value_entry_t,
+            e,
+            1
+        );
+
+        e = next;
+    }
+
+    state->resolver_entries = NULL;
 }
 
 
@@ -1327,6 +1402,460 @@ static mp_obj_t quickjs_promise_to_mp(
     state->promise_entries = pe;
 
     return MP_OBJ_FROM_PTR(p);
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* 阶段 7：ctx.promise() 的 resolve/reject wrapper                              */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * 生命周期设计与 Promise / Function wrapper 完全一致（同一套约定）：
+ *
+ *   - ctx_obj 是 state->self_obj 的强引用，wrapper 存活期间 Context
+ *     不会被 MicroPython GC 提前回收 -> 裸 state 指针始终有效。
+ *   - token 是 state->resolver_entries 条目表里的查找键；真正的 JS
+ *     引用（JS_DupValue）由 state 的条目表持有，wrapper 不持有 JSValue。
+ *   - __del__：仅当 state->ctx 仍存在时按 token 摘除条目并释放；
+ *     Context close 后条目表已整体释放，直接跳过。
+ *   - 调用（resolve(v) / reject(r)）：先检查 context 是否关闭，关闭则抛
+ *     RuntimeError("context closed")。
+ *
+ * promise 状态机不在 Python 侧复制：调用即调用 QuickJS 原生 resolving
+ * function（js_promise_resolve_function_call），首次调用定局、重复调用
+ * 忽略、thenable/promise assimilation 全部由 QuickJS 负责。两个 resolving
+ * function 共享同一 already_resolved 标志（同一 JSPromiseFunctionDataResolved），
+ * 因此 resolve 与 reject 之间也遵循“先到先得”（标准语义）。
+ */
+typedef struct _mp_obj_quickjs_resolver_t {
+    mp_obj_base_t base;
+
+    quickjs_ctx_t *state;
+    mp_obj_t ctx_obj;   /* 强引用：保证 Context 不被 GC（见上） */
+
+    uint32_t token;      /* state->resolver_entries 的查找键 */
+    bool is_reject;      /* true = reject wrapper；false = resolve wrapper */
+} mp_obj_quickjs_resolver_t;
+
+
+static mp_obj_t mod_quickjs_resolver_del(
+    mp_obj_t self_in
+) {
+    mp_obj_quickjs_resolver_t *r =
+        MP_OBJ_TO_PTR(self_in);
+
+    if (r->state != NULL &&
+        r->state->ctx != NULL) {
+
+        quickjs_value_entry_t **pp =
+            &r->state->resolver_entries;
+
+        while (*pp != NULL) {
+
+            if ((*pp)->token == r->token) {
+
+                quickjs_value_entry_t *e =
+                    *pp;
+
+                *pp = e->next;
+
+                JS_FreeValue(
+                    r->state->ctx,
+                    e->val
+                );
+
+                m_del(
+                    quickjs_value_entry_t,
+                    e,
+                    1
+                );
+
+                break;
+            }
+
+            pp = &(*pp)->next;
+        }
+    }
+
+    return mp_const_none;
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_1(
+    mod_quickjs_resolver_del_obj,
+    mod_quickjs_resolver_del
+);
+
+
+/*
+ * 在 state 的 resolver_entries 里按 token 查找 wrapper 的 JS 值。
+ * Close 后、或条目已随 close() 释放时，一律抛 "context closed"。
+ * 返回值是借用（borrowed）：调用方不得 JS_FreeValue。
+ */
+static JSValue quickjs_resolver_lookup(
+    mp_obj_quickjs_resolver_t *r
+) {
+    quickjs_ctx_t *state = r->state;
+
+    if (state == NULL ||
+        state->closed ||
+        state->ctx == NULL ||
+        state->rt == NULL) {
+
+        mp_raise_msg(
+            &mp_type_RuntimeError,
+            MP_ERROR_TEXT(
+                "context closed"
+            )
+        );
+    }
+
+    for (quickjs_value_entry_t *e =
+             state->resolver_entries;
+         e != NULL;
+         e = e->next) {
+
+        if (e->token == r->token) {
+
+            return e->val;
+        }
+    }
+
+    mp_raise_msg(
+        &mp_type_RuntimeError,
+        MP_ERROR_TEXT(
+            "context closed"
+        )
+    );
+
+    return JS_UNDEFINED; /* unreachable */
+}
+
+
+/*
+ * 阶段 7：把 Python 异常转成 JS Error 值（仅 reject(exception) 使用）。
+ *
+ * 复用阶段 3 callback 异常转换的既有机制（quickjs_callback 的异常分支）：
+ * JS_ThrowTypeError("%s: %s", 类型名, str(exc))。区别只是消费方式：
+ * callback 分支让它留在 pending-exception 并返回 JS_EXCEPTION 抛给 JS；
+ * 这里在 JS_ThrowTypeError 之后立即 JS_GetException 取回为 JSValue，
+ * 作为 promise 的 rejection reason 传给 reject 函数。
+ *
+ * 返回值 owned（JS_GetException 取回的新引用），失败时返回 JS_EXCEPTION。
+ * msg 提取用第二层 nlr 保护（str(exc) 自身可能抛异常）。
+ */
+static JSValue quickjs_exception_to_js_error(
+    JSContext *qctx,
+    mp_obj_t exc
+) {
+    const char *type_name =
+        mp_obj_get_type_str(exc);
+
+    const char *msg = NULL;
+
+    nlr_buf_t nlr;
+
+    if (nlr_push(&nlr) == 0) {
+
+        mp_obj_t args_arr[1];
+        args_arr[0] = exc;
+
+        mp_obj_t s =
+            (mp_obj_t)mp_obj_str_make_new(
+                &mp_type_str,
+                1,
+                0,
+                args_arr
+            );
+
+        msg =
+            mp_obj_str_get_str(s);
+
+        nlr_pop();
+
+    } else {
+
+        msg = NULL;
+    }
+
+    JS_ThrowTypeError(
+        qctx,
+        "%s: %s",
+        type_name,
+        (msg != NULL)
+            ? msg
+            : "exception"
+    );
+
+    return JS_GetException(qctx);
+}
+
+
+/*
+ * resolve(value) / reject(reason) Python callable。
+ *
+ *   - resolve(value)：转换 value 后调用 JS resolving function（JS_Call）。
+ *     转换失败（unsupported 类型 / 大整数溢出等）走阶段 6 统一异常模型：
+ *     抛 Python 异常，promise 保持 pending。
+ *   - reject(reason)：同 resolve，但 reason 是 Python 异常时复用
+ *     quickjs_exception_to_js_error 转成 JS Error 值再 reject（与
+ *     callback 抛错产生的 rejection reason 一致）；其余类型同 resolve。
+ *
+ * 执行窗口：JS_Call 期间可能取 thenable 的 then 属性（getter -> 任意
+ * JS / Python callback），因此必须 enter（close 在窗口内被拒绝 "busy"）、
+ * arm/finish timeout（getter 死循环等仍被预算中断）、并包 nlr（转换与
+ * JS 异常都经 quickjs_raise_* 抛 MP 异常）。
+ *
+ * Python 异常绝不穿过 QuickJS C stack：本函数所有失败路径都先把
+ * JS 状态清理干净（转换失败释放 v / JS 异常经 quickjs_raise_exception_state
+ * 消费 pending exception）再经 nlr 抛出。
+ */
+static mp_obj_t mod_quickjs_resolver_call(
+    mp_obj_t self_in,
+    size_t n_args,
+    size_t n_kw,
+    const mp_obj_t *args
+) {
+    mp_obj_quickjs_resolver_t *r =
+        MP_OBJ_TO_PTR(self_in);
+
+    quickjs_ctx_t *state =
+        r->state;
+
+    if (n_kw > 0) {
+
+        mp_raise_msg(
+            &mp_type_TypeError,
+            MP_ERROR_TEXT(
+                "resolver does not support keyword arguments"
+            )
+        );
+    }
+
+    if (n_args > 1) {
+
+        mp_raise_msg(
+            &mp_type_TypeError,
+            MP_ERROR_TEXT(
+                "resolver takes at most 1 value argument"
+            )
+        );
+    }
+
+    if (state == NULL ||
+        state->closed ||
+        state->ctx == NULL ||
+        state->rt == NULL) {
+
+        mp_raise_msg(
+            &mp_type_RuntimeError,
+            MP_ERROR_TEXT(
+                "context closed"
+            )
+        );
+    }
+
+    quickjs_ctx_enter(state);
+
+    nlr_buf_t nlr;
+
+    if (nlr_push(&nlr) == 0) {
+
+        JSContext *qctx =
+            state->ctx;
+
+        JSValue func =
+            quickjs_resolver_lookup(r);
+
+        quickjs_convert_state_t st;
+        memset(&st, 0, sizeof(st));
+
+        /*
+         * 无参调用 -> JS undefined（与 JS resolve()/reject() 一致）。
+         * 类型 call 槽的约定：args[0] 是第一个（也是唯一一个）用户参数，
+         * self 经 self_in 单独传入（与 Function wrapper 一致）。
+         * 转换出的 v 由本函数负责释放（JS_Call 不接管 argv）。
+         */
+        JSValue v = JS_UNDEFINED;
+        bool have_v = false;
+
+        if (n_args >= 1) {
+
+            mp_obj_t value = args[0];
+
+            if (r->is_reject &&
+                mp_obj_is_exception_instance(value)) {
+
+                v =
+                    quickjs_exception_to_js_error(
+                        qctx,
+                        value
+                    );
+
+                if (JS_IsException(v)) {
+
+                    quickjs_raise_exception(
+                        qctx,
+                        v
+                    );
+                }
+
+            } else {
+
+                v =
+                    mp_to_quickjs(
+                        qctx,
+                        value,
+                        &st
+                    );
+
+                if (JS_IsException(v)) {
+
+                    quickjs_raise_exception(
+                        qctx,
+                        v
+                    );
+                }
+            }
+
+            have_v = true;
+        }
+
+        quickjs_ctx_arm_timeout(state);
+
+        JSValue result =
+            (have_v)
+                ? JS_Call(
+                      qctx,
+                      func,
+                      JS_UNDEFINED,
+                      1,
+                      &v
+                  )
+                : JS_Call(
+                      qctx,
+                      func,
+                      JS_UNDEFINED,
+                      0,
+                      NULL
+                  );
+
+        bool timed_out =
+            quickjs_ctx_finish_timeout(state);
+
+        if (have_v) {
+
+            JS_FreeValue(
+                qctx,
+                v
+            );
+        }
+
+        if (JS_IsException(result)) {
+
+            quickjs_raise_exception_state(
+                qctx,
+                result,
+                timed_out
+            );
+        }
+
+        /*
+         * 成功调用（含“已定局、本次调用被忽略”）：
+         * JS resolving function 返回 JS_UNDEFINED，释放后返回 None。
+         */
+        JS_FreeValue(
+            qctx,
+            result
+        );
+
+        nlr_pop();
+
+        quickjs_ctx_leave(state);
+
+        return mp_const_none;
+
+    } else {
+
+        quickjs_ctx_leave(state);
+
+        nlr_raise(nlr.ret_val);
+    }
+
+    return mp_const_none; /* unreachable */
+}
+
+/*
+ * resolve/reject 由 quickjs_resolver_type 的 call 槽直接调用
+ * （mp_obj_is_callable -> 类型 call 槽），无需 FUN_OBJ 对象；
+ * 参数范围 1..2（self + 可选 value）由 mp_arg_check_num 约束。
+ */
+
+
+static const mp_rom_map_elem_t
+quickjs_resolver_locals_dict_table[] = {
+
+    {
+        MP_ROM_QSTR(MP_QSTR___del__),
+        MP_ROM_PTR(
+            &mod_quickjs_resolver_del_obj
+        )
+    },
+};
+
+static MP_DEFINE_CONST_DICT(
+    quickjs_resolver_locals_dict,
+    quickjs_resolver_locals_dict_table
+);
+
+
+MP_DEFINE_CONST_OBJ_TYPE(
+    quickjs_resolver_type,
+    MP_QSTR_PromiseResolver,
+    MP_TYPE_FLAG_NONE,
+    call, mod_quickjs_resolver_call,
+    locals_dict, &quickjs_resolver_locals_dict
+);
+
+
+/*
+ * JS resolving function -> Python callable wrapper（阶段 7）。
+ * 与 quickjs_promise_to_mp 完全同构：dup 进 resolver_entries（state
+ * 所有），wrapper 只拿 token。val 必须来自同一 Context（由调用方保证）。
+ */
+static mp_obj_t quickjs_resolver_to_mp(
+    JSContext *ctx,
+    JSValueConst val,
+    bool is_reject
+) {
+    quickjs_ctx_t *state =
+        (quickjs_ctx_t *)JS_GetContextOpaque(ctx);
+
+    mp_obj_quickjs_resolver_t *r =
+        mp_obj_malloc_with_finaliser(
+            mp_obj_quickjs_resolver_t,
+            &quickjs_resolver_type
+        );
+
+    r->state = state;
+    r->ctx_obj = state->self_obj;
+    r->token = ++state->next_token;
+    r->is_reject = is_reject;
+
+    /*
+     * dup 进条目表（state 所有），wrapper 只拿 token。
+     */
+    quickjs_value_entry_t *re =
+        m_new(
+            quickjs_value_entry_t,
+            1
+        );
+
+    re->token = r->token;
+    re->val = JS_DupValue(ctx, val);
+    re->next = state->resolver_entries;
+    state->resolver_entries = re;
+
+    return MP_OBJ_FROM_PTR(r);
 }
 
 
@@ -2142,7 +2671,6 @@ static void quickjs_raise_value(
     vstr_t vstr;
     bool vstr_ok = false;
     mp_obj_t exc = MP_OBJ_NULL;
-
     nlr_buf_t nlr;
 
     if (nlr_push(&nlr) == 0) {
@@ -6540,6 +7068,195 @@ static MP_DEFINE_CONST_FUN_OBJ_3(
 
 
 /* -------------------------------------------------------------------------- */
+/* Context.promise() —— Python 侧显式 Promise 创建（阶段 7）                     */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * Python:
+ *
+ *     p, resolve, reject = ctx.promise()
+ *
+ * 创建自定 Promise 并返回三个对象：
+ *   - p        : Promise wrapper（与 eval/get 返回的 wrapper 完全一致，
+ *                done/result/then/catch/finally_ 全部可用）
+ *   - resolve  : Python callable；resolve(v) 把 promise 定局为 fulfilled
+ *   - reject   : Python callable；reject(r) 把 promise 定局为 rejected
+ *
+ * 实现：QuickJS 原生 JS_NewPromiseCapability（不 consult
+ * Promise.prototype / Symbol.species）。
+ *
+ * Ownership（对照 quickjs.c js_promise_new / js_create_resolving_functions）：
+ *   - promise            : 1 个新引用 —— dup 进 promise_entries
+ *     （quickjs_promise_to_mp 内部 dup；本函数用完原始引用后释放）；
+ *   - resolving_funcs[0] : 1 个新引用 —— dup 进 resolver_entries
+ *     （resolve wrapper 持有 token）；
+ *   - resolving_funcs[1] : 1 个新引用 —— dup 进 resolver_entries
+ *     （reject wrapper 持有 token）；
+ *   - 失败时 resolving_funcs 均为 JS_UNDEFINED（无引用，free 是 no-op）。
+ *
+ * 状态机不在这里复制：resolve/reject 是 JS 原生 resolving function，
+ * 首次调用定局、重复调用忽略、promise/thenable assimilation 全由
+ * QuickJS 负责（见 quickjs.c js_promise_resolve_function_call：
+ * 非对象值同步定局；对象取 then——函数则入 thenable job——非函数定局）。
+ *
+ * 窗口：JS_NewPromiseCapability 可能分配失败抛 JS 异常（OOM），
+ * wrapper 创建可能抛 MP 异常（内存不足），统一包 nlr；三份原生引用
+ * 在两条失败路径上都释放，成功路径 wrapper 创建完成后释放。
+ */
+static mp_obj_t mod_quickjs_ctx_promise(
+    mp_obj_t self_in
+) {
+    quickjs_ctx_t *state =
+        quickjs_ctx_check_open(self_in);
+
+    quickjs_ctx_enter(state);
+
+    nlr_buf_t nlr;
+
+    if (nlr_push(&nlr) == 0) {
+
+        JSContext *qctx =
+            state->ctx;
+
+        quickjs_ctx_arm_timeout(state);
+
+        JSValue resolving_funcs[2];
+
+        JSValue promise =
+            JS_NewPromiseCapability(
+                qctx,
+                resolving_funcs
+            );
+
+        bool timed_out =
+            quickjs_ctx_finish_timeout(state);
+
+        if (JS_IsException(promise)) {
+
+            /*
+             * js_promise_new 失败时 resolving_funcs[0/1] 已置为
+             * JS_UNDEFINED（JS_FreeValue 无操作），仍显式释放，
+             * 保持“三份引用要么都释放要么都移交”的不变量。
+             */
+            JS_FreeValue(
+                qctx,
+                resolving_funcs[0]
+            );
+
+            JS_FreeValue(
+                qctx,
+                resolving_funcs[1]
+            );
+
+            quickjs_raise_exception_state(
+                qctx,
+                promise,
+                timed_out
+            );
+        }
+
+        /*
+         * 创建三个 wrapper。MP 分配失败（nlr）时释放三份原生引用
+         * 再重抛，保证失败路径不泄漏 JSValue。
+         */
+        nlr_buf_t nlr2;
+
+        if (nlr_push(&nlr2) == 0) {
+
+            mp_obj_t pw =
+                quickjs_promise_to_mp(
+                    qctx,
+                    promise
+                );
+
+            mp_obj_t rw =
+                quickjs_resolver_to_mp(
+                    qctx,
+                    resolving_funcs[0],
+                    false
+                );
+
+            mp_obj_t jw =
+                quickjs_resolver_to_mp(
+                    qctx,
+                    resolving_funcs[1],
+                    true
+                );
+
+            /* wrapper 已各自 dup 进条目表，释放原始引用 */
+            JS_FreeValue(
+                qctx,
+                promise
+            );
+
+            JS_FreeValue(
+                qctx,
+                resolving_funcs[0]
+            );
+
+            JS_FreeValue(
+                qctx,
+                resolving_funcs[1]
+            );
+
+            mp_obj_t items[3];
+            items[0] = pw;
+            items[1] = rw;
+            items[2] = jw;
+
+            mp_obj_t result =
+                mp_obj_new_tuple(
+                    3,
+                    items
+                );
+
+            /* 成功路径：两个 nlr 窗口都必须 pop（遗漏会留下悬垂的
+             * nlr_top，后续任何 nlr_raise 都会经残留链跳到已回收的
+             * 栈帧 -> 野跳转/内存破坏；阶段 6 审计的同类问题）。 */
+            nlr_pop();      /* pop 内层窗口 */
+            nlr_pop();      /* pop 外层窗口 */
+
+            quickjs_ctx_leave(state);
+
+            return result;
+
+        } else {
+
+            JS_FreeValue(
+                qctx,
+                promise
+            );
+
+            JS_FreeValue(
+                qctx,
+                resolving_funcs[0]
+            );
+
+            JS_FreeValue(
+                qctx,
+                resolving_funcs[1]
+            );
+
+            nlr_raise(nlr2.ret_val);
+        }
+
+    } else {
+
+        quickjs_ctx_leave(state);
+
+        nlr_raise(nlr.ret_val);
+    }
+
+    return mp_const_none; /* unreachable */
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_1(
+    mod_quickjs_ctx_promise_obj,
+    mod_quickjs_ctx_promise
+);
+
+
+/* -------------------------------------------------------------------------- */
 /* Context.gc()                                                               */
 /* -------------------------------------------------------------------------- */
 
@@ -6826,6 +7543,13 @@ quickjs_context_locals_dict_table[] = {
     },
 
     {
+        MP_ROM_QSTR(MP_QSTR_promise),
+        MP_ROM_PTR(
+            &mod_quickjs_ctx_promise_obj
+        )
+    },
+
+    {
         MP_ROM_QSTR(MP_QSTR_add_callable),
         MP_ROM_PTR(
             &mod_quickjs_ctx_add_callable_obj
@@ -6985,6 +7709,11 @@ static mp_obj_t mod_quickjs_help(void) {
 
         "  ctx.close()\n"
         "      Free the runtime (idempotent; also runs on GC)\n"
+
+        "  ctx.promise()\n"
+        "      -> (p, resolve, reject): create a pending Promise from Python\n"
+        "      (settle with resolve(value) / reject(reason); first call wins,\n"
+        "       thenables/other promises are assimilated natively)\n"
 
         "  ctx.get('func') -> callable wrapper\n"
         "      JS functions convert to Python callables\n"

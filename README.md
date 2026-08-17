@@ -41,11 +41,22 @@ specific tag or commit, re-fetch with `QJS_REF`:
 QJS_REF=v0.16.1 ./get_quickjs.sh
 ```
 
-> The default QuickJS heap limit is 64 KiB (matching the original ESP32
-> build). On 64-bit hosts QuickJS-NG needs more than 64 KiB just to create a
-> JSContext, so Make-based builds raise the default via
-> `-DQUICKJS_DEFAULT_MEMORY_LIMIT` (default 8 MiB; override on the make
-> command line). CMake ports keep 64 KiB.
+> The default QuickJS heap limit is 128 KiB (`QUICKJS_DEFAULT_MEMORY_LIMIT` in
+> `modquickjs.c`, no longer overridden at build time). On a 64-bit host
+> QuickJS-NG needs more than 64 KiB just to create a JSContext, so Make-based
+> builds of this module have always needed a host-side override; the default
+> was raised to 128 KiB because that is the verified *device* budget needed
+> for one full Context (see ESP32 notes below). Override on the make command
+> line with `CFLAGS_USERMOD=-DQUICKJS_DEFAULT_MEMORY_LIMIT=...` if desired.
+>
+> **ESP32 limitation:** with a 128 KiB QuickJS heap limit the device can
+> reliably hold **one** Context: quickjs.eval, Context() create/close/recreate,
+> eval/call/get/set, Python callbacks, Function wrappers, timeouts,
+> Promise/run_jobs and `ctx.promise()` all work. Creating a *second*
+> Context concurrently fails with `failed to create JS Context` — this is the
+> expected resource limit, not a bug, and this module intentionally does not
+> try to fit multiple Contexts (it never alters QuickJS-NG memory policy).
+> After `ctx.close()` a fresh Context (re)creation succeeds.
 
 ## API
 
@@ -87,6 +98,9 @@ ctx.set_max_stack_size(256*1024) # JS stack limit, 0 = unlimited (default 1 MiB)
 ctx._js_mem()                  # debug: JS heap usage in bytes
 
 ctx.close()                    # free runtime; idempotent
+
+# Phase 7: create a promise from Python
+p, resolve, reject = ctx.promise()   # -> (Promise wrapper, resolve, reject)
 ```
 
 Each `Context` owns an independent runtime, so global state is fully
@@ -286,6 +300,57 @@ native `Promise.prototype.finally`):
   they are released by the JS GC once the reaction is consumed — they never
   grow the JS heap, and are unlinked by `ctx.close()`.
 
+### Creating promises from Python: `ctx.promise()`
+
+`ctx.promise()` creates a new pending `Promise` on the Python side and returns
+the three-tuple `(p, resolve, reject)`:
+
+```python
+p, resolve, reject = ctx.promise()   # p: Promise wrapper (same as eval's)
+resolve(42)                          # settle fulfilled
+# reject(ValueError("failed"))       # settle rejected (see below)
+assert p.result() == 42
+```
+
+- `p` is the ordinary Promise wrapper (`done`/`result`/`then`/`catch`/
+  `finally_`), so everything above composes.
+- `resolve`/`reject` are separate MicroPython callables created by the same
+  callback registry as function wrappers (token + strong Context ref). They
+  keep the promise alive: the promise stays reachable for the JS GC while
+  either resolver exists, even after `del p`.
+- **Settlement is first-wins, exactly like JS:** calling `resolve` after a
+  resolution (or any `reject`) is ignored; same for `reject` after a
+  rejection. The Promise state machine — including this rule — lives entirely
+  inside QuickJS; the Python side never tracks settled state.
+- **Thenable/promise assimilation is native:** `resolve(thenable)` or
+  `resolve(existingPromiseWrapper)` runs the standard `Promise Resolve`
+  algorithm (the internal `then` probe + thenable job). A thenable's `.then`
+  may run arbitrary JS — or a Python callback — so `resolve` is a full
+  guarded window: execution depth, timeout, and exception conversion all
+  apply, and the context re-entrancy rules hold.
+  A promise wrapper from another Context (or after its Context closed) is
+  rejected by the conversion layer (`promise belongs to another context` /
+  `context closed`) and the promise stays pending.
+- `resolve(None)` -> `null` -> `None`; `resolve(dict/list/bytes/BigInt)`
+  convert as usual (bytes -> `ArrayBuffer`, BigInt beyond int64 raises
+  `BigInt out of range` while the promise stays pending).
+- **Rejecting with a Python exception:** `reject(ValueError("failed"))` turns
+  the exception into a JS `TypeError: ValueError: failed` for the rejection
+  reason (same conversion the callback path uses); `p.result()` then raises
+  the corresponding MicroPython `RuntimeError`. Non-exception reasons pass
+  through the normal conversion (`reject("failed")` -> reason `"failed"`).
+  When an `Error`-typed reason flows *into a Python handler* it converts to
+  `{}` (documented JS Error -> MP limitation; `p.result()` still formats it
+  properly).
+- **Lifetime:** `resolve`/`reject` are attached to the Context exactly like
+  other wrappers. Dropping them (`del`, GC order irrelevant) never affects
+  pending work; their internal JS references are released by `ctx.close()`
+  with everything else. After `close()`, calling `resolve()`/`reject()`
+  raises `RuntimeError("context closed")` (and the returned promise's
+  methods do too) — no dangling access, no reliance on finaliser order.
+- Calling `resolve`/`reject` while the Context is executing elsewhere keeps
+  the `context is busy` protection for nested JS execution.
+
 ## Function wrapper pass-through
 
 A JS function wrapper obtained from one Context can be handed back into the
@@ -423,6 +488,7 @@ micropython tests/test_quickjs_phase3.py   # function bridge + timeout
 micropython tests/test_quickjs_phase4.py   # promise/job queue + pass-through + lifecycle
 micropython tests/test_quickjs_phase5.py   # reentrancy, promise bridging, this, TypedArray, bigint, GC/lifetime
 micropython tests/test_quickjs_phase6.py   # execution safety: nested timeout budget, conversion ownership, contamination
+micropython tests/test_quickjs_phase7.py   # python-side promise creation/control (ctx.promise)
 ```
 
 ## Layout
