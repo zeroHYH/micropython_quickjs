@@ -351,6 +351,63 @@ assert p.result() == 42
 - Calling `resolve`/`reject` while the Context is executing elsewhere keeps
   the `context is busy` protection for nested JS execution.
 
+### async / await (native QuickJS execution model)
+
+QuickJS implements `async function` / `await` natively (an internal state
+machine + the same promise reaction job queue this module already pumps),
+so **no extra engine wiring was needed** — Phase 8 verified the whole model
+on top of the existing `run_jobs()` / wrappers / callback registry /
+`ctx.promise()` integration:
+
+```python
+ctx.eval("async function foo() { return 42; }")
+p = ctx.get("foo")()       # p is the ordinary Promise wrapper
+ctx.run_jobs()
+assert p.result() == 42
+```
+
+Observed semantics (pinned by the tests):
+
+- **Async functions return a Promise wrapper.** If the body completes with
+  *no* suspension point, the result promise settles **synchronously** —
+  `p.done() is True` right after the call and no job is queued. With any
+  `await`, the promise stays pending until `ctx.run_jobs()`.
+- **`await` composes with every promise source**: JS promises
+  (`Promise.resolve`), Python-created promises (`ctx.promise()` — resolving
+  from Python then draining settles the awaiting async function), and
+  awaited Python callbacks.
+- **Python callbacks may be awaited.** A callback that *returns a Promise
+  wrapper* of the same Context is assimilated by the native `PromiseResolve`
+  path (the `mp_to_quickjs` pass-through), so `await py_cb()` suspends until
+  the returned promise settles. A Python exception raised inside an awaited
+  callback rejects the async function's promise.
+- **Microtask drain is complete**: one `ctx.run_jobs()` call executes *every*
+  pending job, including jobs enqueued while draining (`.then` chains,
+  nested awaits, callbacks resolving other promises mid-drain). Afterwards
+  `has_pending_jobs()` is `False`. The return value is the job count
+  (`0` when nothing was pending); call it repeatedly in a `while`-loop if you
+  prefer being independent of a single-call guarantee.
+- **Error model**: async `throw`, awaited rejections, callback exceptions,
+  conversion failures, timeout and OOM all surface as rejection *state*
+  (via `p.result()`) or as a MicroPython exception — never as a stale JS
+  pending exception. The Context stays immediately usable
+  (`ctx.eval("1 + 2") == 3` right after any of them).
+- **Timeout covers the job pump** (`ctx.set_time_limit`): an infinite
+  `await` loop or a synchronous loop inside a `.then` job is interrupted;
+  `run_jobs()` raises `JavaScript execution timeout` and the Context remains
+  reusable (remaining jobs stay queued and can be drained later).
+- **`ctx.close()` inside a job is refused** (`context is busy`, same phase-6
+  rule; visible as a rejection if uncaught, or catchable inside the
+  callback), and after a successful `close()` every access path
+  (`run_jobs` / `done` / `result`) reports `context closed`.
+- **Lifetime**: dropping the async-function wrapper, the returned promise
+  wrapper, or even the only Python reference to the Context (promise
+  wrappers hold the Context alive) never strands a pending chain — drain
+  still completes. GC of pending promises is safe (wrapper token model).
+- Stress parity: 1000 async/await invocations and 1000-link promise chains
+  drain fully with no persistent JS or MicroPython heap growth (see the
+  Phase 8 tests).
+
 ## Function wrapper pass-through
 
 A JS function wrapper obtained from one Context can be handed back into the
@@ -489,6 +546,7 @@ micropython tests/test_quickjs_phase4.py   # promise/job queue + pass-through + 
 micropython tests/test_quickjs_phase5.py   # reentrancy, promise bridging, this, TypedArray, bigint, GC/lifetime
 micropython tests/test_quickjs_phase6.py   # execution safety: nested timeout budget, conversion ownership, contamination
 micropython tests/test_quickjs_phase7.py   # python-side promise creation/control (ctx.promise)
+micropython tests/test_quickjs_phase8.py   # async/await execution model (native, no engine changes)
 ```
 
 ## Layout
