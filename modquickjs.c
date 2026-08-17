@@ -12,6 +12,26 @@
 
 
 /* -------------------------------------------------------------------------- */
+/* 默认内存限制                                                                 */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * 与原始 ESP32 构建保持一致：默认 64 KiB QuickJS 堆。
+ *
+ * 注意：在 64 位宿主上（例如 Unix port 的 64 位构建），
+ * QuickJS-NG 仅初始化一个 JSContext 就需要超过 64 KiB，
+ * 因此 Make 型 port 可以通过 CFLAGS 覆盖该值，例如：
+ *
+ *   -DQUICKJS_DEFAULT_MEMORY_LIMIT=8388608
+ *
+ * CMake 型 port（ESP32/RP2 等）不使用该宏，保持 64 KiB 不变。
+ */
+#ifndef QUICKJS_DEFAULT_MEMORY_LIMIT
+#define QUICKJS_DEFAULT_MEMORY_LIMIT (64 * 1024)
+#endif
+
+
+/* -------------------------------------------------------------------------- */
 /* QuickJS Runtime / Context                                                  */
 /* -------------------------------------------------------------------------- */
 
@@ -54,52 +74,133 @@ static void quickjs_raise_exception(
 ) {
     JSValue exception_val = JS_GetException(ctx);
 
-    const char *err_msg =
-        JS_ToCString(ctx, exception_val);
-
-    if (err_msg != NULL) {
-
-        size_t len = strlen(err_msg);
-
-        char *msg = m_new(char, len + 1);
-
-        memcpy(msg, err_msg, len + 1);
-
-        JS_FreeCString(
-            ctx,
-            err_msg
-        );
-
-        JS_FreeValue(
-            ctx,
-            exception_val
-        );
-
-        JS_FreeValue(
-            ctx,
-            val
-        );
-
-        mp_raise_msg(
-            &mp_type_RuntimeError,
-            msg
-        );
-    }
-
-    JS_FreeValue(
-        ctx,
-        exception_val
-    );
-
+    /*
+     * val 是调用方传入的 JS_EXCEPTION 哨兵（或 JS_UNDEFINED）。
+     *
+     * 这类值没有引用计数，JS_FreeValue 是无操作，
+     * 但为了保证所有权语义统一，仍然显式释放。
+     */
     JS_FreeValue(
         ctx,
         val
     );
 
+    if (!JS_IsUninitialized(exception_val)) {
+
+        const char *err_msg =
+            JS_ToCString(ctx, exception_val);
+
+        if (err_msg != NULL) {
+
+            /*
+             * 使用 mp_raise_msg_varg 把动态消息安全拷贝进
+             * MicroPython 异常对象（异常对象持有 GC 字符串，
+             * 不会像 m_new + mp_raise_msg 那样泄漏堆内存）。
+             */
+            JS_FreeCString(
+                ctx,
+                err_msg
+            );
+
+            JS_FreeValue(
+                ctx,
+                exception_val
+            );
+
+            mp_raise_msg_varg(
+                &mp_type_RuntimeError,
+                MP_ERROR_TEXT("%s"),
+                err_msg
+            );
+
+            return;
+        }
+
+        /*
+         * JS_ToCString 失败时可能又产生了一个挂起异常，
+         * 取回并释放，避免影响后续 JS 调用。
+         */
+        JSValue exc2 = JS_GetException(ctx);
+
+        if (!JS_IsUninitialized(exc2)) {
+            JS_FreeValue(ctx, exc2);
+        }
+
+        JS_FreeValue(
+            ctx,
+            exception_val
+        );
+    }
+
     mp_raise_msg(
         &mp_type_RuntimeError,
         MP_ERROR_TEXT("QuickJS exception")
     );
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* 辅助函数                                                                    */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * 取回并释放 QuickJS 上下文中挂起的异常。
+ *
+ * 用于非致命错误路径：某些失败（例如 JS_ToCStringLen 失败、
+ * 跳过某个不可转换的对象属性）会让 QuickJS 留下“待取回”的异常，
+ * 如果不清除，后续 JS 调用会看到陈旧的异常状态。
+ */
+static void quickjs_clear_pending_exception(
+    JSContext *ctx
+) {
+    JSValue exc = JS_GetException(ctx);
+
+    if (!JS_IsUninitialized(exc)) {
+
+        JS_FreeValue(
+            ctx,
+            exc
+        );
+    }
+}
+
+
+/*
+ * 把 JSValue 转换为 MicroPython 对象，并在转换抛出 MicroPython
+ * 异常时释放 owned 持有的 JSValue 引用。
+ *
+ * 转换函数内部可能因为“不支持的嵌套类型”等原因 mp_raise 抛异常，
+ * 该异常会越过调用者直接跳转。如果调用者此前持有 owned 引用，
+ * 就会泄漏。这里用 nlr 保护：异常时先释放 owned，再重新抛出。
+ */
+static mp_obj_t quickjs_to_mp_owned(
+    JSContext *ctx,
+    JSValueConst val,
+    JSValue owned
+) {
+    nlr_buf_t nlr;
+
+    if (nlr_push(&nlr) == 0) {
+
+        mp_obj_t result =
+            quickjs_to_mp_obj(
+                ctx,
+                val
+            );
+
+        nlr_pop();
+
+        return result;
+    }
+
+    JS_FreeValue(
+        ctx,
+        owned
+    );
+
+    nlr_raise(nlr.ret_val);
+
+    return mp_const_none; /* unreachable */
 }
 
 
@@ -126,6 +227,9 @@ static mp_obj_t quickjs_string_to_mp(
         );
 
     if (str == NULL) {
+
+        /* JS_ToCStringLen 失败会在 ctx 挂起异常，取回并释放。 */
+        quickjs_clear_pending_exception(ctx);
 
         mp_raise_msg(
             &mp_type_RuntimeError,
@@ -169,12 +273,15 @@ static mp_obj_t quickjs_array_to_mp(
 
     if (JS_IsException(length_val)) {
 
-        mp_raise_msg(
-            &mp_type_RuntimeError,
-            MP_ERROR_TEXT(
-                "failed to get JS array length"
-            )
+        /*
+         * 把 QuickJS 挂起的异常转换成 MicroPython 异常。
+         */
+        quickjs_raise_exception(
+            ctx,
+            length_val
         );
+
+        return mp_const_none;
     }
 
     if (JS_ToUint32(
@@ -188,12 +295,12 @@ static mp_obj_t quickjs_array_to_mp(
             length_val
         );
 
-        mp_raise_msg(
-            &mp_type_RuntimeError,
-            MP_ERROR_TEXT(
-                "invalid JS array length"
-            )
+        quickjs_raise_exception(
+            ctx,
+            JS_UNDEFINED
         );
+
+        return mp_const_none;
     }
 
     JS_FreeValue(
@@ -231,18 +338,23 @@ static mp_obj_t quickjs_array_to_mp(
                 );
             }
 
-            mp_raise_msg(
-                &mp_type_RuntimeError,
-                MP_ERROR_TEXT(
-                    "failed to get JS array element"
-                )
+            quickjs_raise_exception(
+                ctx,
+                item
             );
+
+            return mp_const_none;
         }
 
 
+        /*
+         * 如果转换过程中抛出 MicroPython 异常，
+         * quickjs_to_mp_owned 会负责释放 item。
+         */
         items[i] =
-            quickjs_to_mp_obj(
+            quickjs_to_mp_owned(
                 ctx,
+                item,
                 item
             );
 
@@ -297,12 +409,16 @@ static mp_obj_t quickjs_object_to_mp(
 
     if (ret < 0) {
 
-        mp_raise_msg(
-            &mp_type_RuntimeError,
-            MP_ERROR_TEXT(
-                "failed to enumerate JS object"
-            )
+        /*
+         * JS_GetOwnPropertyNames 失败时会在 ctx 中挂起异常，
+         * 取回并转换成 MicroPython 异常。
+         */
+        quickjs_raise_exception(
+            ctx,
+            JS_UNDEFINED
         );
+
+        return mp_const_none;
     }
 
 
@@ -327,6 +443,10 @@ static mp_obj_t quickjs_object_to_mp(
             );
 
         if (JS_IsException(key_val)) {
+
+            /* 非致命：跳过该属性，但必须先清除挂起的异常。 */
+            quickjs_clear_pending_exception(ctx);
+
             continue;
         }
 
@@ -341,6 +461,9 @@ static mp_obj_t quickjs_object_to_mp(
             );
 
         if (key == NULL) {
+
+            /* 非致命：跳过。 */
+            quickjs_clear_pending_exception(ctx);
 
             JS_FreeValue(
                 ctx,
@@ -358,35 +481,83 @@ static mp_obj_t quickjs_object_to_mp(
                 atom
             );
 
-        if (!JS_IsException(value)) {
+        if (JS_IsException(value)) {
 
-            mp_obj_t mp_key =
-                mp_obj_new_str(
-                    key,
-                    key_len
+            /*
+             * 获取属性失败：取回并释放异常，
+             * 同时释放已经分配的资源，跳过该属性。
+             */
+            quickjs_clear_pending_exception(ctx);
+
+            JS_FreeCString(
+                ctx,
+                key
+            );
+
+            JS_FreeValue(
+                ctx,
+                key_val
+            );
+
+            continue;
+        }
+
+
+        {
+            nlr_buf_t nlr;
+
+            if (nlr_push(&nlr) == 0) {
+
+                mp_obj_t mp_key =
+                    mp_obj_new_str(
+                        key,
+                        key_len
+                    );
+
+                mp_obj_t mp_value =
+                    quickjs_to_mp_obj(
+                        ctx,
+                        value
+                    );
+
+                mp_obj_dict_store(
+                    MP_OBJ_TO_PTR(result),
+                    mp_key,
+                    mp_value
                 );
 
+                nlr_pop();
 
-            mp_obj_t mp_value =
-                quickjs_to_mp_obj(
+            } else {
+
+                /*
+                 * 转换抛出 MicroPython 异常：
+                 * 释放 value / key / key_val 后重新抛出。
+                 */
+                JS_FreeValue(
                     ctx,
                     value
                 );
 
+                JS_FreeCString(
+                    ctx,
+                    key
+                );
 
-            mp_obj_dict_store(
-                MP_OBJ_TO_PTR(result),
-                mp_key,
-                mp_value
-            );
+                JS_FreeValue(
+                    ctx,
+                    key_val
+                );
 
-
-            JS_FreeValue(
-                ctx,
-                value
-            );
+                nlr_raise(nlr.ret_val);
+            }
         }
 
+
+        JS_FreeValue(
+            ctx,
+            value
+        );
 
         JS_FreeCString(
             ctx,
@@ -400,9 +571,15 @@ static mp_obj_t quickjs_object_to_mp(
     }
 
 
-    js_free(
+    /*
+     * 必须使用 JS_FreePropertyEnum：
+     * 它会逐个释放每个 property 的 atom，再释放数组本身。
+     * 直接 js_free(props) 会泄漏所有 atom。
+     */
+    JS_FreePropertyEnum(
         ctx,
-        props
+        props,
+        prop_count
     );
 
     return result;
@@ -469,10 +646,19 @@ static mp_obj_t quickjs_to_mp_obj(
 
 
         /* ---------------------------------------------------------------- */
-        /* string                                                            */
+        /* string / string rope                                              */
         /* ---------------------------------------------------------------- */
 
+        /*
+         * QuickJS 中字符串有两种 tag：
+         *
+         *   JS_TAG_STRING      普通字符串
+         *   JS_TAG_STRING_ROPE 拼接产生的 rope 字符串
+         *
+         * 两者都必须通过 JS_ToCStringLen() 转换。
+         */
         case JS_TAG_STRING:
+        case JS_TAG_STRING_ROPE:
 
             return quickjs_string_to_mp(
                 ctx,
@@ -518,6 +704,9 @@ static mp_obj_t quickjs_to_mp_obj(
                 &value,
                 val
             ) < 0) {
+
+            /* 清除 JS 侧挂起的异常，再抛出 MicroPython 异常。 */
+            quickjs_clear_pending_exception(ctx);
 
             mp_raise_msg(
                 &mp_type_TypeError,
@@ -628,16 +817,12 @@ static JSValue mp_list_to_quickjs(
             ) < 0) {
 
             /*
-             * JS_SetPropertyUint32()
-             * 在成功时接管 value 的所有权。
+             * QuickJS-NG v0.16.1 的 JS_SetPropertyUint32()
+             * 无论成功还是失败都接管 value 的所有权
+             * （失败时内部已调用 JS_FreeValue）。
              *
-             * 失败时释放它。
+             * 这里不能再 JS_FreeValue(value)，否则 double free。
              */
-            JS_FreeValue(
-                ctx,
-                value
-            );
-
             JS_FreeValue(
                 ctx,
                 array
@@ -706,11 +891,10 @@ static JSValue mp_tuple_to_quickjs(
                 value
             ) < 0) {
 
-            JS_FreeValue(
-                ctx,
-                value
-            );
-
+            /*
+             * 同 mp_list_to_quickjs：
+             * JS_SetPropertyUint32() 已接管 value 所有权。
+             */
             JS_FreeValue(
                 ctx,
                 array
@@ -775,11 +959,14 @@ static JSValue mp_dict_to_quickjs(
                 object
             );
 
-            mp_raise_msg(
-                &mp_type_TypeError,
-                MP_ERROR_TEXT(
-                    "JS object keys must be str"
-                )
+            /*
+             * 不在调用栈中途抛 Python 异常（会泄漏外层 JSValue），
+             * 而是设置 JS 异常后返回 JS_EXCEPTION，
+             * 由最外层统一转换成 MicroPython 异常。
+             */
+            return JS_ThrowTypeError(
+                ctx,
+                "JS object keys must be str"
             );
         }
 
@@ -818,11 +1005,9 @@ static JSValue mp_dict_to_quickjs(
                 value
             ) < 0) {
 
-            JS_FreeValue(
-                ctx,
-                value
-            );
-
+            /*
+             * JS_SetPropertyStr() 已接管 value 所有权。
+             */
             JS_FreeValue(
                 ctx,
                 object
@@ -988,14 +1173,17 @@ static JSValue mp_to_quickjs(
     /* unsupported                                                             */
     /* ---------------------------------------------------------------------- */
 
-    mp_raise_msg(
-        &mp_type_TypeError,
-        MP_ERROR_TEXT(
-            "unsupported MicroPython type"
-        )
+    /*
+     * 不在这里抛 Python 异常：mp_to_quickjs 可能处于
+     * 参数/嵌套转换的中途，nlr 长跳会泄漏外层已创建的 JSValue。
+     *
+     * 改为设置 JS 异常并返回 JS_EXCEPTION，
+     * 由最外层 (mod_quickjs_call) 统一转换成 MicroPython 异常。
+     */
+    return JS_ThrowTypeError(
+        ctx,
+        "unsupported MicroPython type"
     );
-
-    return JS_EXCEPTION;
 }
 
 
@@ -1027,11 +1215,11 @@ static mp_obj_t mod_quickjs_init(void) {
 
 
     /*
-     * 64 KiB QuickJS heap
+     * 默认 QuickJS 堆上限（可通过编译期宏覆盖，见文件头部说明）
      */
     JS_SetMemoryLimit(
         rt,
-        64 * 1024
+        QUICKJS_DEFAULT_MEMORY_LIMIT
     );
 
 
@@ -1126,9 +1314,14 @@ static mp_obj_t mod_quickjs_eval(
     }
 
 
+    /*
+     * 转换过程中抛出 MicroPython 异常时，
+     * quickjs_to_mp_owned 负责释放 val。
+     */
     mp_obj_t result =
-        quickjs_to_mp_obj(
+        quickjs_to_mp_owned(
             ctx,
+            val,
             val
         );
 
@@ -1274,7 +1467,7 @@ static mp_obj_t mod_quickjs_call(
         if (JS_IsException(argv[i])) {
 
             /*
-             * 释放已经创建的参数
+             * 释放已经创建/转换的参数。
              */
             for (int j = 0;
                  j < i;
@@ -1302,6 +1495,19 @@ static mp_obj_t mod_quickjs_call(
                 func
             );
 
+
+            /*
+             * 参数转换失败：
+             *
+             * mp_to_quickjs 遇到不支持的 MicroPython 类型时会
+             * 设置 JS 异常并返回 JS_EXCEPTION，这里把它转换成
+             * MicroPython 异常（路由到统一异常处理，不会泄漏）。
+             */
+            quickjs_raise_exception(
+                ctx,
+                argv[i]
+            );
+
             return mp_const_none;
         }
     }
@@ -1325,7 +1531,9 @@ static mp_obj_t mod_quickjs_call(
      *
      * JS_Call 不会替我们释放 argv 中的 JSValue。
      */
-    for (int i = 0; i < argc; i++)_FreeValue(
+    for (int i = 0; i < argc; i++) {
+
+        JS_FreeValue(
             ctx,
             argv[i]
         );
@@ -1364,10 +1572,14 @@ static mp_obj_t mod_quickjs_call(
 
     /*
      * JS -> MicroPython
+     *
+     * 转换抛出 MicroPython 异常时，
+     * quickjs_to_mp_owned 负责释放 result。
      */
     mp_obj_t mp_result =
-        quickjs_to_mp_obj(
+        quickjs_to_mp_owned(
             ctx,
+            result,
             result
         );
 
@@ -1541,8 +1753,11 @@ const mp_obj_module_t mp_module_quickjs = {
 };
 
 
-MP_REGISTER_MODULE(
-    MP_QSTR_quickjs,
-    mp_module_quickjs
-);
+/*
+ * 注意：必须写成单行。
+ *
+ * MicroPython 的 makeqstrdefs.py 用正则从预处理输出中提取
+ * MP_REGISTER_MODULE(...)，其正则默认不跨行匹配。
+ */
+MP_REGISTER_MODULE(MP_QSTR_quickjs, mp_module_quickjs);
 
