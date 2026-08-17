@@ -93,10 +93,18 @@ static void quickjs_raise_exception(
         if (err_msg != NULL) {
 
             /*
-             * 使用 mp_raise_msg_varg 把动态消息安全拷贝进
-             * MicroPython 异常对象（异常对象持有 GC 字符串，
-             * 不会像 m_new + mp_raise_msg 那样泄漏堆内存）。
+             * 先用 mp_obj_new_exception_msg_varg 把动态消息
+             * 安全拷贝进 MicroPython 异常对象（异常对象持有
+             * GC 字符串，不会像 m_new + mp_raise_msg 那样泄漏堆内存；
+             * 也不会像旧写法那样在释放后继续使用 err_msg）。
              */
+            mp_obj_t exc =
+                mp_obj_new_exception_msg_varg(
+                    &mp_type_RuntimeError,
+                    MP_ERROR_TEXT("%s"),
+                    err_msg
+                );
+
             JS_FreeCString(
                 ctx,
                 err_msg
@@ -107,13 +115,7 @@ static void quickjs_raise_exception(
                 exception_val
             );
 
-            mp_raise_msg_varg(
-                &mp_type_RuntimeError,
-                MP_ERROR_TEXT("%s"),
-                err_msg
-            );
-
-            return;
+            nlr_raise(exc);
         }
 
         /*
