@@ -408,6 +408,54 @@ Observed semantics (pinned by the tests):
   drain fully with no persistent JS or MicroPython heap growth (see the
   Phase 8 tests).
 
+### Unhandled promise rejection diagnostics
+
+`ctx.set_unhandled_rejection_handler(callable_or_None)` bridges the native
+QuickJS `JS_SetHostPromiseRejectionTracker()` (runtime level, one tracker
+per Context) to a Python callback:
+
+```python
+ctx.set_unhandled_rejection_handler(handler)   # handler(reason, is_handled)
+ctx.eval("Promise.reject('boom')")             # handler called with ("boom", False)
+ctx.run_jobs()                                  # diagnostic: never raises
+```
+
+Guaranteed semantics (pinned by the Phase 9 tests, verified against the
+vendored source):
+
+- **Events are synchronous, not asynchronous**: there is no "unhandled
+  rejection job". `is_handled == False` fires at the rejection instant
+  (inside `eval`/`call`/`run_jobs`/`resolve`/`reject`), and
+  `is_handled == True` fires at the instant a `.then`/`.catch` handler is
+  attached to an already-rejected promise. A rejection that is promptly
+  caught produces both events, in order; a never-caught rejection produces
+  just the first.
+- **Diagnostic, not execution error**: `run_jobs()` never raises for an
+  unhandled rejection (the phase 8 job semantics are untouched).
+- Only promises that are rejected and not yet handled produce events. A
+  promise that is pending when a handler attaches is already "handled" and
+  never reports.
+- QuickJS idiosyncrasy (pinned, not "fixed"): attaching a fulfil-only
+  `.then()` to a rejected promise also marks it handled and fires the
+  `is_handled == True` event.
+- `reason` is a **borrowed** JSValue converted immediately through the
+  normal conversion layer (str/number/dict/list pass through; a JS `Error`
+  converts to `{}` — the same documented limitation as everywhere else;
+  `p.result()` still formats the Error properly).
+- **Handler exceptions are swallowed and recorded** (kept on the internal
+  handler node, GC-safe): a MicroPython exception can never cross the
+  QuickJS C stack from inside the tracker (which may be called mid-
+  `fulfill_or_reject_promise`). Later events keep being delivered; the
+  Context stays fully usable.
+- **Reentrancy**: the tracker runs inside an active execution window, so a
+  handler may call `eval`/`run_jobs` (nested, order preserved) and calling
+  `ctx.close()` inside it is refused with `RuntimeError("context is busy")`.
+- **Lifetime**: the handler is rooted by a GC-scanned node (same model as
+  the callback registry — no static MP GC root). Replacement frees the old
+  node, `None` unregisters the tracker, and `ctx.close()` unregisters the
+  tracker and frees the node so no callback ever fires after close.
+- The default singleton (`quickjs.eval`) has no tracker.
+
 ## Function wrapper pass-through
 
 A JS function wrapper obtained from one Context can be handed back into the
@@ -547,6 +595,7 @@ micropython tests/test_quickjs_phase5.py   # reentrancy, promise bridging, this,
 micropython tests/test_quickjs_phase6.py   # execution safety: nested timeout budget, conversion ownership, contamination
 micropython tests/test_quickjs_phase7.py   # python-side promise creation/control (ctx.promise)
 micropython tests/test_quickjs_phase8.py   # async/await execution model (native, no engine changes)
+micropython tests/test_quickjs_phase9.py   # unhandled rejection diagnostics (set_unhandled_rejection_handler)
 ```
 
 ## Layout

@@ -208,6 +208,10 @@ static JSContext *ctx = NULL;
 typedef struct _quickjs_callback_t
     quickjs_callback_t;
 
+/* 阶段 9：unhandled rejection handler 节点（完整定义见下） */
+typedef struct _quickjs_rejection_handler_t
+    quickjs_rejection_handler_t;
+
 typedef struct _quickjs_ctx_t {
     JSRuntime *rt;
     JSContext *ctx;
@@ -310,6 +314,27 @@ typedef struct _quickjs_ctx_t {
      */
     struct _quickjs_value_entry_t *resolver_entries;
     uint32_t next_token;    /* 0 保留给“无 token”；单调递增，不复用 */
+
+    /*
+     * 阶段 9：unhandled promise rejection 诊断 handler。
+     *
+     * 通过 QuickJS 原生 JS_SetHostPromiseRejectionTracker() 上报：
+     *   - is_handled == false：promise 被 reject（同步，在 reject 动作内）；
+     *   - is_handled == true ：rejection 后续被 handler 接管（.then/.catch
+     *     挂到已 rejected 的 promise 上，同步）。
+     *
+     * 节点（quickjs_rejection_handler_t）由 m_new_obj 分配在 GC 堆，
+     * 由本指针引用 -> state 块被 GC 标记时保守扫描到节点 -> 节点的
+     * callable/last_error 字段随节点被扫描，handler 在注册期间不会被
+     * 回收（与 callbacks 链表同一套结论，无需 static GC root）。
+     *
+     * 生命周期与 callbacks 完全一致：
+     *   - 替换：旧节点 m_del（解除 callable 引用），链入新节点；
+     *   - None：解除注册 + m_del 节点；
+     *   - close()：先 JS_SetHostPromiseRejectionTracker(rt, NULL, NULL)
+     *     解除注册，再 m_del 节点（close 后不再有 tracker 回调）。
+     */
+    quickjs_rejection_handler_t *rejection_handler;
 } quickjs_ctx_t;
 
 /*
@@ -2117,6 +2142,228 @@ static void quickjs_callback_free_node(
         1
     );
 }
+
+
+/* -------------------------------------------------------------------------- */
+/* 阶段 9：Unhandled Promise Rejection 诊断（JS_SetHostPromiseRejectionTracker） */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * handler 节点。与 quickjs_callback_t 同一套 GC 结论：
+ *   节点 m_new_obj 分配在 GC 堆；state->rejection_handler 是 state 块
+ *   （被标记）里的裸指针，保守扫描使节点保持存活；节点的
+ *   callable / last_error（mp_obj_t 字段）随节点一起被扫描，
+ *   因此 handler 在注册期间不会被 MicroPython GC 回收。
+ *
+ * 节点不生成 CClosure、不持有 JSValue：tracker 是纯 C 函数指针
+ * （JSHostPromiseRejectionTracker），注册进 JSRuntime 即可。
+ */
+typedef struct _quickjs_rejection_handler_t {
+    quickjs_ctx_t *state;
+    mp_obj_t callable;    /* Python handler（GC root，经节点保守扫描） */
+    mp_obj_t last_error;  /* handler 最近一次抛出的异常（记录，不重抛） */
+} quickjs_rejection_handler_t;
+
+
+/*
+ * QuickJS rejection tracker 回调（quickjs.h:1174 的
+ * JSHostPromiseRejectionTracker 签名，逐字对照 vendored 源码）。
+ *
+ * 调用时机（已在源码中确认）：
+ *   - is_handled == false：fulfill_or_reject_promise() 在 reject 动作内
+ *     同步调用（quickjs.c:55589），此时 promise 尚未挂任何 reaction；
+ *   - is_handled == true ：perform_promise_then() 挂 handler 到
+ *     已 rejected 的 promise 时同步调用（quickjs.c:56416），随后
+ *     s->is_handled = true。
+ *   不会在 Context close / Runtime free 期间调用（源码中 tracker 的
+ *   全部 5 个调用点都不在 finalizer/free 路径上）——close 后不会再有
+ *   本回调进入。
+ *
+ * promise / reason 都是【借用】（JSValueConst）：只在本次调用内使用，
+ * 立即转换成 MicroPython 对象，绝不保存 JSValue。reason 是
+ * s->promise_result（已定局的 rejection 值），转换语义与 p.result()
+ * 完全一致（Error 对象 -> {}，字符串 -> str，等等）。
+ *
+ * 异常模型：本函数可能被 QuickJS 的 resolve 调用链中段调用
+ * （fulfill_or_reject_promise 已写入 promise_result / promise_state、
+ * 尚未入队 reactions）。Python handler（或 reason 转换）抛出的
+ * MicroPython 异常【绝不能】穿过 QuickJS C stack——否则 nlr 长跳会
+ * 破坏 QuickJS 中间状态。策略：nlr 捕获 -> 吞掉并记录到
+ * node->last_error（GC 安全），不重抛、不转 JS 异常。
+ */
+static void quickjs_promise_rejection_tracker(
+    JSContext *qctx,
+    JSValueConst promise,
+    JSValueConst reason,
+    bool is_handled,
+    void *opaque
+) {
+    quickjs_ctx_t *state =
+        (quickjs_ctx_t *)opaque;
+
+    if (state == NULL ||
+        state->closed ||
+        state->ctx == NULL ||
+        state->rt == NULL ||
+        qctx != state->ctx) {
+
+        return;
+    }
+
+    quickjs_rejection_handler_t *node =
+        state->rejection_handler;
+
+    if (node == NULL ||
+        node->callable == MP_OBJ_NULL) {
+
+        return;
+    }
+
+    /*
+     * 纵深防御：与 quickjs_callback 一致，handler 执行期间也计入
+     * 重入深度。正常路径本回调只在 JS 执行窗口内被调（eval/call/
+     * run_jobs/resolve/then 都已 enter），这里再 +1 保证 handler 内
+     * 调 ctx.close() 必被拒绝（RuntimeError("context is busy")）。
+     */
+    quickjs_ctx_enter(state);
+
+    quickjs_convert_state_t st;
+    memset(&st, 0, sizeof(st));
+
+    nlr_buf_t nlr;
+
+    if (nlr_push(&nlr) == 0) {
+
+        mp_obj_t args[2];
+
+        /* reason 是借用值，立即转换成 MP 对象（复制语义） */
+        args[0] =
+            quickjs_to_mp_obj(
+                qctx,
+                reason,
+                &st
+            );
+
+        args[1] =
+            mp_obj_new_bool(
+                is_handled
+            );
+
+        mp_call_function_n_kw(
+            node->callable,
+            2,
+            0,
+            args
+        );
+
+        nlr_pop();
+
+        quickjs_ctx_leave(state);
+
+        return;
+
+    } else {
+
+        /* handler / reason 转换抛出的 Python 异常：吞掉并记录 */
+        node->last_error =
+            nlr.ret_val;
+
+        quickjs_ctx_leave(state);
+
+        return; /* 不 re-raise：绝不穿透 QuickJS C stack */
+    }
+}
+
+
+/*
+ * Python:
+ *
+ *     ctx.set_unhandled_rejection_handler(callable_or_none)
+ *
+ * 注册（或禁用）该 Context 的 promise rejection 诊断回调。回调签名：
+ *
+ *     handler(reason, is_handled)
+ *
+ *   - is_handled == False：promise 被 reject（同步，reject 动作内）；
+ *   - is_handled == True ：rejection 被 .then/.catch 接管（同步）。
+ *
+ * handler 抛出的异常被吞掉并记录（见 quickjs_promise_rejection_tracker），
+ * 不影响后续事件。传 None 解除注册（等价于删除）。
+ */
+static mp_obj_t mod_quickjs_ctx_set_unhandled_rejection_handler(
+    mp_obj_t self_in,
+    mp_obj_t callable
+) {
+    quickjs_ctx_t *state =
+        quickjs_ctx_check_open(self_in);
+
+    if (callable != mp_const_none &&
+        !mp_obj_is_callable(callable)) {
+
+        mp_raise_TypeError(
+            MP_ERROR_TEXT(
+                "handler must be callable or None"
+            )
+        );
+    }
+
+    /*
+     * 替换/禁用：先摘除旧节点（m_del 解除对旧 callable 的引用），
+     * 再写 tracker 注册。
+     */
+    if (state->rejection_handler != NULL) {
+
+        quickjs_rejection_handler_t *old =
+            state->rejection_handler;
+
+        state->rejection_handler = NULL;
+
+        old->state = NULL;
+        old->callable = MP_OBJ_NULL;
+        old->last_error = MP_OBJ_NULL;
+
+        m_del(
+            quickjs_rejection_handler_t,
+            old,
+            1
+        );
+    }
+
+    if (callable == mp_const_none) {
+
+        JS_SetHostPromiseRejectionTracker(
+            state->rt,
+            NULL,
+            NULL
+        );
+
+        return mp_const_none;
+    }
+
+    quickjs_rejection_handler_t *node =
+        m_new_obj(
+            quickjs_rejection_handler_t
+        );
+
+    node->state = state;
+    node->callable = callable;
+    node->last_error = MP_OBJ_NULL;
+
+    state->rejection_handler = node;
+
+    JS_SetHostPromiseRejectionTracker(
+        state->rt,
+        quickjs_promise_rejection_tracker,
+        state
+    );
+
+    return mp_const_none;
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_2(
+    mod_quickjs_ctx_set_unhandled_rejection_handler_obj,
+    mod_quickjs_ctx_set_unhandled_rejection_handler
+);
 
 
 /* -------------------------------------------------------------------------- */
@@ -6618,7 +6865,20 @@ static mp_obj_t mod_quickjs_ctx_close(
      * 阶段 3：释放回调注册表的 JSValue 引用（ctx 仍有效时）。
      * 闭包在 JS_FreeContext 里 finalize 时会触碰其 opaque 节点，
      * 因此节点必须先保持存活、再释放（见下方 m_del 循环）。
+     *
+     * 阶段 9：先解除 rejection tracker 注册（rt 仍有效时）。
+     * 源码确认 tracker 不会在 close/free 期间被调用，这里解除是
+     * 纵深防御 + 语义清晰：close 后该 runtime 不再产生诊断事件。
      */
+    if (state->rt != NULL) {
+
+        JS_SetHostPromiseRejectionTracker(
+            state->rt,
+            NULL,
+            NULL
+        );
+    }
+
     if (state->ctx != NULL) {
 
         /*
@@ -6684,6 +6944,29 @@ static mp_obj_t mod_quickjs_ctx_close(
     }
 
     state->callbacks = NULL;
+
+
+    /*
+     * 阶段 9：释放 rejection handler 节点（此时 runtime 已释放、
+     * tracker 已解除注册，不会再有任何回调进入）。
+     */
+    if (state->rejection_handler != NULL) {
+
+        quickjs_rejection_handler_t *rh =
+            state->rejection_handler;
+
+        state->rejection_handler = NULL;
+
+        rh->state = NULL;
+        rh->callable = MP_OBJ_NULL;
+        rh->last_error = MP_OBJ_NULL;
+
+        m_del(
+            quickjs_rejection_handler_t,
+            rh,
+            1
+        );
+    }
 
 
     return mp_const_none;
@@ -7599,6 +7882,13 @@ quickjs_context_locals_dict_table[] = {
     },
 
     {
+        MP_ROM_QSTR(MP_QSTR_set_unhandled_rejection_handler),
+        MP_ROM_PTR(
+            &mod_quickjs_ctx_set_unhandled_rejection_handler_obj
+        )
+    },
+
+    {
         MP_ROM_QSTR(MP_QSTR_set_memory_limit),
         MP_ROM_PTR(
             &mod_quickjs_ctx_set_memory_limit_obj
@@ -7697,6 +7987,9 @@ static mp_obj_t mod_quickjs_help(void) {
 
         "  ctx.has_pending_jobs()\n"
         "      True if there are unexecuted JS jobs\n"
+
+        "  ctx.set_unhandled_rejection_handler(cb_or_None)\n"
+        "      Diagnose unhandled promise rejections: cb(reason, is_handled)\n"
 
         "  ctx.set_memory_limit(bytes)\n"
         "      Set the JS heap limit (0 = unlimited)\n"
