@@ -59,6 +59,7 @@ quickjs.eval("1 + 2")     # -> 3
 quickjs.call("add", 1, 2)
 quickjs.run_jobs()        # execute pending JS jobs (promise microtasks)
 quickjs.has_pending_jobs()  # -> bool
+quickjs.bigint(10**30)    # explicit BigInt marker (see BigInt below)
 quickjs.version()         # -> "0.16.1"
 quickjs.help()
 ```
@@ -95,6 +96,14 @@ but never rely on it alone.
 
 After `close()`, every Context method raises `RuntimeError("context closed")`.
 
+While a JS call is executing (a Python callback is on the C stack, or a
+microtask is running), calling `ctx.close()` raises
+`RuntimeError("context is busy")` instead of tearing down a runtime that is
+mid-execution. The rejected `close()` is a no-op: the context stays fully
+usable. The busy window covers `eval`/`call`/`get`/`set`/`run_jobs`/
+`add_callable`, function-wrapper calls, and Promise methods; the depth
+counter is restored on *every* path (return, exception, timeout, job error).
+
 ### JS Function <-> MicroPython callable
 
 ```python
@@ -107,6 +116,24 @@ assert add(1, 2) == 3
 The wrapper keeps its `Context` alive (strong reference), so it never dangles.
 After `ctx.close()` the wrapper raises `RuntimeError("context closed")`.
 Keyword arguments are rejected with `TypeError`.
+
+### `this` binding (`wrapper.call`)
+
+```python
+ctx.eval("globalThis.obj = { value: 42, getValue: function(x){ return this.value + x; } };")
+getValue = ctx.eval("obj.getValue")
+obj = ctx.get("obj")
+
+getValue.call(obj, 8)          # -> 50   (this = obj)
+getValue(8)                    # -> NaN  (default: this is undefined -> sloppy-mode global)
+```
+
+- `wrapper.call(this_obj, *args)` binds `this` to the converted
+  `this_obj` (dict/object/callable/Promise — anything convertible).
+- `wrapper(*args)` keeps the original behaviour: `this` is passed as
+  `JS_UNDEFINED` (JS sloppy mode coerces it to the global object).
+- Cross-context `this` is rejected (`function belongs to another context`),
+  as with any other wrapper pass-through.
 
 ```python
 def multiply(a, b):
@@ -184,7 +211,6 @@ p = ctx.eval("Promise.resolve(42)")
 p.done()                 # -> bool: settled (fulfilled or rejected)?
 p.result()               # -> 42  (raises the rejection, or RuntimeError if pending)
 ```
-
 - `p.result()` on a fulfilled promise converts the value as usual
   (object/array/bytes/etc.).
 - On a **rejected** promise it raises the rejection as a MicroPython
@@ -209,6 +235,49 @@ Notes:
 - After `ctx.close()`, `done()`/`result()` raise
   `RuntimeError("context closed")`; the wrapper never touches a dangling
   JS value.
+
+### Bridging: `p.then` / `p.catch` / `p.finally_`
+
+The wrapper also exposes the native promise combinators, letting Python
+attach reaction callbacks to a JS promise and chain further promises on the
+Python side:
+
+```python
+q = p.then(on_fulfilled=None, on_rejected=None)   # -> new Promise wrapper
+q = p.catch(on_rejected=None)                      # -> p.then(None, r)
+q = p.finally_(callback=None)                      # -> new Promise wrapper
+```
+
+```python
+p = ctx.eval("Promise.resolve(10)")
+q = p.then(lambda x: x * 2)          # Python callback runs in a microtask
+ctx.run_jobs()                        # execute the reaction job
+q.result()                            # -> 20
+```
+
+Semantics (implemented on the native QuickJS `JS_PromiseThen` and the
+native `Promise.prototype.finally`):
+
+- Handlers may be Python callables, JS function wrappers (same Context), or
+  `None` (absent). Anything else raises `TypeError`.
+- The callback runs as a **microtask**: drive it with `ctx.run_jobs()`
+  (returns after each completed job). Rejections are *state* — call
+  `q.result()` on the derived promise.
+- **Return-value rules** (per the spec `PromiseResolve` path):
+  - returns a **Promise wrapper** of the same Context -> assimilated
+    (the derived promise settles with the inner promise's outcome);
+  - returns a **JS Function wrapper** -> passes through as a JS value;
+  - returns anything else -> converted as usual (`None` -> `null`);
+  - a Python exception in the callback rejects the derived promise.
+- `p.then()` / `p.catch()` with no handlers is a native pass-through.
+- `finally_` runs its callback on settle and propagates the original
+  outcome (like JS `Promise.prototype.finally`), including rejections.
+- Cross-context handlers/returned promises are rejected
+  (`promise belongs to another context`); a wrapper whose Context was
+  closed raises `context closed`.
+- Promise handler nodes are unnamed and carry no strong `js_func` ref, so
+  they are released by the JS GC once the reaction is consumed — they never
+  grow the JS heap, and are unlinked by `ctx.close()`.
 
 ## Function wrapper pass-through
 
@@ -246,8 +315,10 @@ was closed raises `context closed`.
 | `dict` | `Object` (string keys only) |
 | `bytes` | `ArrayBuffer` |
 | `bytearray` | `Uint8Array` |
+| `quickjs.bigint(n)` | `BigInt` (arbitrary precision; see below) |
 | Python callable | `Function` (via `add_callable`) |
 | JS Function wrapper | its `Function` (same Context only; cross-Context → error) |
+| JS Promise wrapper | its `Promise` (same Context only; cross-Context → error) |
 
 | JS | MicroPython |
 |---|---|
@@ -258,26 +329,50 @@ was closed raises `context closed`.
 | `Array` | `list` |
 | `Object` | `dict` |
 | `ArrayBuffer` | `bytes` |
-| `Uint8Array` | `bytes` |
+| TypedArray (any kind) | `bytes` — raw byte representation (see below) |
 | `BigInt` (int64 range) | `int` |
 | `Function` | Python callable wrapper |
-| `Promise` | Promise wrapper (`done()` / `result()`) |
+| `Promise` | Promise wrapper (`done()` / `result()` / `then()` / `catch()` / `finally_()`) |
 
-`bytes` / `ArrayBuffer` / `bytearray` / `Uint8Array` conversions are **copy
+`bytes` / `ArrayBuffer` / `bytearray` / TypedArray conversions are **copy
 semantics** — no borrowed pointers in either direction, so the Python object
 and the JS value never alias.
 
+### BigInt
+
+Python `int` -> JS stays a `number` (int32/float64, unchanged). For an
+explicit JS `BigInt`, use `quickjs.bigint(value)`:
+
+```python
+ctx.set("x", quickjs.bigint(123456789012345678901234567890))   # arbitrary precision
+ctx.eval("x.toString()")    # -> "123456789012345678901234567890"
+ctx.set("y", quickjs.bigint(-42))                              # negative / 0 / small OK
+```
+
+- Values within int64 range use the official `JS_NewBigInt64` C API; values
+  beyond int64 are parsed from a strictly-validated `[0-9]+` decimal string
+  into a BigInt literal (no fake arbitrary precision, no truncation).
+- `quickjs.bigint()` requires an integer (`ValueError` otherwise).
+- Reading a BigInt back into Python is limited to int64 (larger values
+  raise `TypeError: BigInt out of range` — read them via `x.toString()`).
+
+### TypedArray -> bytes
+
+Any JS TypedArray (`Int8Array`, `Uint8Array`, `Uint8ClampedArray`,
+`Int16Array`, `Uint16Array`, `Int32Array`, `Uint32Array`, `Float32Array`,
+`Float64Array`, plus BigInt64/Float16) converts to `bytes` as its **raw byte
+representation**: the view slice (`subarray` offsets respected) in **host
+byte order**, with no element interpretation. `Uint8Array` behaviour is
+unchanged. Detached buffers raise an error.
+
 ### Not supported (yet)
 
-- JS `this` binding for wrappers (calls pass `JS_UNDEFINED`)
-- `Uint8Array` is the only supported TypedArray; others raise
-  `TypeError: unsupported typed array`
 - `Symbol` -> raises `TypeError`
-- `BigInt` outside int64 range -> raises `TypeError: BigInt out of range`
+- `BigInt` outside int64 range read back -> raises `TypeError: BigInt out of range`
   (never silently converted to float or truncated)
-- Python `int` -> JS BigInt (Python ints stay int32/float64)
-- Python-side promise construction / `p.then(cb)` on the wrapper
-  (promise chains are written in JS; the wrapper is read-only)
+- Python-side *construction* of a new Promise with executor function
+  (promises are created in JS; `then`/`catch`/`finally_` bridge the other way)
+- `Map` / `Set` / `Date` / typed-array *element* semantics (raw bytes only)
 
 ### Exceptions
 
@@ -310,6 +405,7 @@ micropython tests/test_quickjs_phase1.py   # Context lifecycle / GC
 micropython tests/test_quickjs_phase2.py   # depth/cycles, binary, BigInt, errors
 micropython tests/test_quickjs_phase3.py   # function bridge + timeout
 micropython tests/test_quickjs_phase4.py   # promise/job queue + pass-through + lifecycle
+micropython tests/test_quickjs_phase5.py   # reentrancy, promise bridging, this, TypedArray, bigint, GC/lifetime
 ```
 
 ## Layout

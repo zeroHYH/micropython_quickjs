@@ -173,20 +173,23 @@ assert r == b"\x0a\x14\x1e", r
 print("Uint8Array -> bytes OK")
 
 # =============================================================
-# 13. unsupported TypedArray
+# 13. TypedArray -> raw bytes (Phase 5: all typed arrays)
 # =============================================================
+# Phase 5 将任意 TypedArray 统一转换为 raw byte representation
+# （视图切片，宿主字节序，不解释元素）。Uint8Array -> bytes 行为不变。
 for expr in (
     "new Uint16Array([1,2,3])",
     "new Int8Array([1,2,3])",
     "new Float32Array([1.5])",
     "new BigInt64Array([1n])",
 ):
-    try:
-        ctx.eval(expr)
-        raise AssertionError("expected TypeError for %s" % expr)
-    except TypeError as e:
-        assert "unsupported typed array" in str(e), str(e)
-print("unsupported TypedArray OK")
+    r = ctx.eval(expr)
+    assert type(r) is bytes, (expr, r)
+assert len(ctx.eval("new Uint16Array([1,2,3])")) == 6
+assert len(ctx.eval("new Int8Array([1,2,3])")) == 3
+assert len(ctx.eval("new Float32Array([1.5])")) == 4
+assert len(ctx.eval("new BigInt64Array([1n])")) == 8
+print("TypedArray -> raw bytes OK")
 
 # =============================================================
 # 14. BigInt
