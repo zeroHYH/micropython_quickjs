@@ -276,6 +276,13 @@ static void quickjs_clear_pending_exception(
     JSContext *ctx
 );
 
+static mp_obj_t quickjs_to_mp_owned(
+    JSContext *ctx,
+    JSValueConst val,
+    JSValue owned,
+    quickjs_convert_state_t *st
+);
+
 static mp_obj_t quickjs_call_value_helper(
     quickjs_ctx_t *state,
     JSValueConst func,
@@ -306,6 +313,33 @@ static quickjs_ctx_t *quickjs_ctx_check_open(
 static void quickjs_raise_exception(
     JSContext *ctx,
     JSValue val
+);
+
+/*
+ * 把调用方持有的 JSValue（异常值/ rejection reason）格式化为
+ * MicroPython 异常并抛出。调用方把所有权移交给本函数。
+ * 阶段 4：供 rejected promise 的 result() 复用。
+ */
+static void quickjs_raise_value(
+    JSContext *ctx,
+    JSValue exception_val
+);
+
+static mp_obj_t quickjs_promise_to_mp(
+    JSContext *ctx,
+    JSValueConst val
+);
+
+static mp_obj_t mod_quickjs_promise_done(
+    mp_obj_t self_in
+);
+
+static mp_obj_t mod_quickjs_promise_result(
+    mp_obj_t self_in
+);
+
+static mp_obj_t mod_quickjs_promise_del(
+    mp_obj_t self_in
 );
 
 
@@ -437,6 +471,295 @@ static mp_obj_t quickjs_function_to_mp(
     f->attached = true;
 
     return MP_OBJ_FROM_PTR(f);
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* JS Promise -> MicroPython wrapper                                           */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * 阶段 4：ctx.eval() / ctx.get() 遇到 JS Promise 时返回 Promise wrapper。
+ *
+ * 生命周期设计与 Function wrapper 完全一致（复用同一套约定）：
+ *
+ *   - ctx_obj 是 state->self_obj 的强引用，wrapper 存活期间 Context 不会
+ *     被 MicroPython GC 提前回收 -> 裸 state 指针始终有效。
+ *   - promise_val 持有对 JS promise 的一个引用（JS_DupValue）。
+ *   - __del__：仅当 state->ctx 仍存在时 JS_FreeValue(promise_val)；
+ *     Context close 后 JS 堆已释放，promise_val 是悬垂值，绝不触碰。
+ *   - done()/result() 先检查 context 是否关闭，关闭则抛
+ *     RuntimeError("context closed")，绝不触碰悬垂 promise_val。
+ *
+ * 读取性 API（不执行 JS 代码，因此不需要 timeout 窗口）：
+ *   - p.done()   -> bool：promise 是否已定局（fulfilled 或 rejected）
+ *   - p.result() -> fulfilled 返回转换后的值；
+ *                   rejected 把 rejection 转成 Python 异常抛出；
+ *                   pending 抛 RuntimeError（提示先 ctx.run_jobs()）
+ */
+typedef struct _mp_obj_quickjs_promise_t {
+    mp_obj_base_t base;
+
+    quickjs_ctx_t *state;
+    mp_obj_t ctx_obj;   /* 强引用：保证 Context 不被 GC（见上） */
+
+    JSValue promise_val; /* 对 JS promise 对象的引用 */
+
+    bool attached;       /* 当前是否持有 promise_val，需在 __del__ 释放 */
+} mp_obj_quickjs_promise_t;
+
+
+static mp_obj_t mod_quickjs_promise_del(
+    mp_obj_t self_in
+) {
+    mp_obj_quickjs_promise_t *p =
+        MP_OBJ_TO_PTR(self_in);
+
+    if (p->attached &&
+        p->state != NULL &&
+        p->state->ctx != NULL) {
+
+        JS_FreeValue(
+            p->state->ctx,
+            p->promise_val
+        );
+    }
+
+    p->attached = false;
+    p->promise_val = JS_UNDEFINED;
+
+    return mp_const_none;
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_1(
+    mod_quickjs_promise_del_obj,
+    mod_quickjs_promise_del
+);
+
+
+static mp_obj_t mod_quickjs_promise_done(
+    mp_obj_t self_in
+) {
+    mp_obj_quickjs_promise_t *p =
+        MP_OBJ_TO_PTR(self_in);
+
+    quickjs_ctx_t *state =
+        p->state;
+
+    if (state == NULL ||
+        state->closed ||
+        state->ctx == NULL ||
+        state->rt == NULL) {
+
+        mp_raise_msg(
+            &mp_type_RuntimeError,
+            MP_ERROR_TEXT(
+                "context closed"
+            )
+        );
+    }
+
+    JSPromiseStateEnum s =
+        JS_PromiseState(
+            state->ctx,
+            p->promise_val
+        );
+
+    if (s == JS_PROMISE_NOT_A_PROMISE) {
+
+        mp_raise_msg(
+            &mp_type_TypeError,
+            MP_ERROR_TEXT(
+                "not a promise"
+            )
+        );
+    }
+
+    return mp_obj_new_bool(
+        s != JS_PROMISE_PENDING
+    );
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_1(
+    mod_quickjs_promise_done_obj,
+    mod_quickjs_promise_done
+);
+
+
+static mp_obj_t mod_quickjs_promise_result(
+    mp_obj_t self_in
+) {
+    mp_obj_quickjs_promise_t *p =
+        MP_OBJ_TO_PTR(self_in);
+
+    quickjs_ctx_t *state =
+        p->state;
+
+    if (state == NULL ||
+        state->closed ||
+        state->ctx == NULL ||
+        state->rt == NULL) {
+
+        mp_raise_msg(
+            &mp_type_RuntimeError,
+            MP_ERROR_TEXT(
+                "context closed"
+            )
+        );
+    }
+
+    JSPromiseStateEnum s =
+        JS_PromiseState(
+            state->ctx,
+            p->promise_val
+        );
+
+    if (s == JS_PROMISE_NOT_A_PROMISE) {
+
+        mp_raise_msg(
+            &mp_type_TypeError,
+            MP_ERROR_TEXT(
+                "not a promise"
+            )
+        );
+    }
+
+    if (s == JS_PROMISE_PENDING) {
+
+        mp_raise_msg(
+            &mp_type_RuntimeError,
+            MP_ERROR_TEXT(
+                "promise not settled; call ctx.run_jobs()"
+            )
+        );
+    }
+
+
+    /*
+     * JS_PromiseResult 返回新引用（quickjs.c 中 js_dup），归我们释放。
+     */
+    JSValue r =
+        JS_PromiseResult(
+            state->ctx,
+            p->promise_val
+        );
+
+
+    if (s == JS_PROMISE_FULFILLED) {
+
+        quickjs_convert_state_t st;
+        memset(&st, 0, sizeof(st));
+
+        mp_obj_t result =
+            quickjs_to_mp_owned(
+                state->ctx,
+                r,
+                r,
+                &st
+            );
+
+        JS_FreeValue(
+            state->ctx,
+            r
+        );
+
+        return result;
+    }
+
+
+    /*
+     * rejected：把 rejection 转成 Python 异常。
+     * quickjs_raise_value 持有并释放 r（不经 pending-exception，
+     * 不污染 JSContext 异常状态）。
+     */
+    quickjs_raise_value(
+        state->ctx,
+        r
+    );
+
+    return mp_const_none; /* unreachable */
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_1(
+    mod_quickjs_promise_result_obj,
+    mod_quickjs_promise_result
+);
+
+
+static const mp_rom_map_elem_t
+quickjs_promise_locals_dict_table[] = {
+
+    {
+        MP_ROM_QSTR(MP_QSTR___del__),
+        MP_ROM_PTR(
+            &mod_quickjs_promise_del_obj
+        )
+    },
+
+    {
+        MP_ROM_QSTR(MP_QSTR_done),
+        MP_ROM_PTR(
+            &mod_quickjs_promise_done_obj
+        )
+    },
+
+    {
+        MP_ROM_QSTR(MP_QSTR_result),
+        MP_ROM_PTR(
+            &mod_quickjs_promise_result_obj
+        )
+    },
+};
+
+static MP_DEFINE_CONST_DICT(
+    quickjs_promise_locals_dict,
+    quickjs_promise_locals_dict_table
+);
+
+
+MP_DEFINE_CONST_OBJ_TYPE(
+    quickjs_promise_type,
+    MP_QSTR_Promise,
+    MP_TYPE_FLAG_NONE,
+    locals_dict, &quickjs_promise_locals_dict
+);
+
+
+static mp_obj_t quickjs_promise_to_mp(
+    JSContext *ctx,
+    JSValueConst val
+) {
+    /*
+     * 只有 Context 运行时有 state（通过 JS_GetContextOpaque 关联）。
+     * 默认 singleton 的 ctx 没有 opaque -> 保持“unsupported”行为
+     * （与 Function wrapper 一致），不做误导性的空 dict 转换。
+     */
+    quickjs_ctx_t *state =
+        (quickjs_ctx_t *)JS_GetContextOpaque(ctx);
+
+    if (state == NULL ||
+        state->closed) {
+
+        mp_raise_msg(
+            &mp_type_TypeError,
+            MP_ERROR_TEXT(
+                "unsupported QuickJS value type"
+            )
+        );
+    }
+
+    mp_obj_quickjs_promise_t *p =
+        mp_obj_malloc_with_finaliser(
+            mp_obj_quickjs_promise_t,
+            &quickjs_promise_type
+        );
+
+    p->state = state;
+    p->ctx_obj = state->self_obj;
+    p->promise_val = JS_DupValue(ctx, val);
+    p->attached = true;
+
+    return MP_OBJ_FROM_PTR(p);
 }
 
 
@@ -1121,27 +1444,29 @@ static const char *quickjs_error_prop_str(
  * 任何一步失败都用 nlr 保护，先释放 JS 资源再重抛，
  * 不会 use-after-free，不会泄漏。
  */
-static void quickjs_raise_exception(
+static void quickjs_raise_value(
     JSContext *ctx,
-    JSValue val
+    JSValue exception_val
 ) {
-    JSValue exception_val = JS_GetException(ctx);
-
     /*
-     * val 是调用方传入的 JS_EXCEPTION 哨兵（或 JS_UNDEFINED）。
-     * 这类值没有引用计数，JS_FreeValue 是无操作。
+     * 把调用方持有的 JSValue 异常值（或 promise rejection reason）
+     * 格式化为 MicroPython 异常并 nlr_raise。exception_val 的所有权
+     * 移交给本函数（负责释放）。
+     *
+     * 与 quickjs_raise_exception 的区别：这里直接处理值本身，不从 ctx
+     * 取回 pending exception —— rejected promise 的 result() 场景下，
+     * rejection 是 promise 内部状态，并非 JSContext 上的 pending
+     * exception，不能走 JS_GetException 路径。
+     *
+     * 流程严格保证：
+     *   构建消息（vstr，GC 内存）
+     *   -> 创建 MicroPython 异常（复制消息）
+     *   -> 释放所有 JS 字符串 / 异常值
+     *   -> nlr_raise
+     *
+     * 任何一步失败都用 nlr 保护，先释放 JS 资源再重抛，
+     * 不会 use-after-free，不会泄漏。
      */
-    JS_FreeValue(ctx, val);
-
-    if (JS_IsUninitialized(exception_val)) {
-
-        mp_raise_msg(
-            &mp_type_RuntimeError,
-            MP_ERROR_TEXT("QuickJS exception")
-        );
-    }
-
-
     const char *name = NULL;
     const char *message = NULL;
     const char *stack = NULL;
@@ -1283,6 +1608,37 @@ static void quickjs_raise_exception(
 
 
 /*
+ * QuickJS 挂起异常（JS_GetException）-> MicroPython 异常。
+ *
+ * 与 quickjs_raise_value 的区别：从 ctx 取回 pending exception 后
+ * 交给 quickjs_raise_value 格式化。val 是调用方传入的 JS_EXCEPTION
+ * 哨兵（或 JS_UNDEFINED），无引用计数，JS_FreeValue 是无操作。
+ */
+static void quickjs_raise_exception(
+    JSContext *ctx,
+    JSValue val
+) {
+    JSValue exception_val =
+        JS_GetException(ctx);
+
+    JS_FreeValue(ctx, val);
+
+    if (JS_IsUninitialized(exception_val)) {
+
+        mp_raise_msg(
+            &mp_type_RuntimeError,
+            MP_ERROR_TEXT("QuickJS exception")
+        );
+    }
+
+    quickjs_raise_value(
+        ctx,
+        exception_val
+    );
+}
+
+
+/*
  * 阶段 3：带 timeout 标志的异常抛出。
  *
  * 若本次 JS 执行因 interrupt（超时）被中断，QuickJS 抛出的
@@ -1385,6 +1741,105 @@ static mp_obj_t quickjs_to_mp_owned(
     nlr_raise(nlr.ret_val);
 
     return mp_const_none; /* unreachable */
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* JS job queue（microtask 泵）                                                 */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * 执行当前 Runtime 的 pending jobs（microtasks），直到队列清空。
+ *
+ * 返回执行的 job 数量（无 job 时返回 0）。
+ *
+ * 设计要点：
+ *
+ *   - 复用 js_std_loop 的泵模式（quickjs-libc.c）：
+ *     JS_ExecutePendingJob 循环直到返回 0；每个 job 执行时可能入队新 job
+ *     （.then 链 / async），因此必须循环而非只执行一次。
+ *
+ *   - JS_ExecutePendingJob 返回值语义（quickjs.c:2531）：
+ *       < 0   job 执行抛出 uncatchable 异常（interrupt/"interrupted"/OOM），
+ *             异常挂在返回的 *pctx 上；
+ *       0     无 pending job；
+ *       1     成功执行一个 job。
+ *
+ *   - Promise rejection 不是执行错误：promise_reaction_job 内部会消费普通
+ *     异常并转给 reject 函数，因此 rejected promise 不会让本函数抛 Python
+ *     异常；rejection 作为 promise 状态由 wrapper 的 result() 呈现。
+ *
+ *   - 整个泵过程包在 timeout 窗口内（arm/finish），超时中断（uncatchable
+ *     "interrupted"）会在此转成 timeout 异常。
+ *
+ *   - state 可空：NULL 表示默认 singleton（无 timeout，用全局 rt/ctx）。
+ */
+static mp_obj_t quickjs_run_jobs_helper(
+    quickjs_ctx_t *state
+) {
+    JSContext *qctx =
+        (state != NULL)
+            ? state->ctx
+            : ctx;
+
+    JSRuntime *qrt =
+        (state != NULL)
+            ? state->rt
+            : rt;
+
+    int count = 0;
+    JSContext *err_ctx = NULL;
+
+
+    quickjs_ctx_arm_timeout(state);
+
+    for (;;) {
+
+        JSContext *jctx = NULL;
+
+        int err =
+            JS_ExecutePendingJob(
+                qrt,
+                &jctx
+            );
+
+        if (err <= 0) {
+
+            if (err < 0) {
+
+                err_ctx =
+                    (jctx != NULL)
+                        ? jctx
+                        : qctx;
+            }
+
+            break;
+        }
+
+        count++;
+    }
+
+
+    bool timed_out =
+        quickjs_ctx_finish_timeout(state);
+
+
+    if (err_ctx != NULL) {
+
+        /*
+         * job 执行失败：消费挂在 *pctx 上的异常并转成 Python 异常。
+         * 超时中断则转成 timeout 异常。异常抛出后 runtime 恢复可用，
+         * 剩余 job 仍留在队列，后续可再次 run_jobs()。
+         */
+        quickjs_raise_exception_state(
+            err_ctx,
+            JS_UNDEFINED,
+            timed_out
+        );
+    }
+
+
+    return mp_obj_new_int(count);
 }
 
 
@@ -2131,6 +2586,19 @@ static mp_obj_t quickjs_to_mp_obj(
         case JS_TAG_OBJECT: {
 
             /*
+             * Promise：阶段 4 返回 Promise wrapper（Context 运行时）；
+             * 默认 singleton 无 opaque -> 保持“不支持”行为。
+             * 必须放在 Object->dict 之前，否则 Promise 会退化成空 dict。
+             */
+            if (JS_IsPromise(val)) {
+
+                return quickjs_promise_to_mp(
+                    ctx,
+                    val
+                );
+            }
+
+            /*
              * 函数：阶段 3 返回可调用 wrapper（Context 运行时）；
              * 默认 singleton 无 opaque -> 保持“不支持”行为。
              */
@@ -2576,6 +3044,57 @@ static JSValue mp_dict_to_quickjs(
 /* MicroPython object -> JSValue                                              */
 /* -------------------------------------------------------------------------- */
 
+/*
+ * JS Function wrapper -> JS（pass-through）。
+ *
+ * 场景（阶段 4）：
+ *   - ctx.set("bar", f)：f 是同 Context 的 JS 函数 wrapper
+ *   - Python callback 返回 JS 函数 wrapper（此前报
+ *     "unsupported MicroPython type"）
+ *
+ * 安全性：
+ *   - 只允许同 Context（同 Runtime）pass-through；跨 Context / 跨
+ *     Runtime 一律拒绝 —— 绝不能把不同 Runtime 的 JSValue 混过去。
+ *     该错误在 ctx.set 边界经 quickjs_raise_exception 映射为
+ *     RuntimeError，在 callback 返回路径成为 JS 可见异常。
+ *   - Context close 后 wrapper 的 func_val 是悬垂值，绝不触碰，
+ *     直接报 context closed。
+ *   - 返回 JS_DupValue(func_val)（新引用），所有权交给外层
+ *     （JS_SetProperty* 等 move 语义消费），无泄漏。
+ */
+static JSValue quickjs_function_pass_through(
+    JSContext *ctx,
+    mp_obj_t obj
+) {
+    mp_obj_quickjs_function_t *f =
+        (mp_obj_quickjs_function_t *)MP_OBJ_TO_PTR(obj);
+
+    if (f->state == NULL ||
+        f->state->closed ||
+        f->state->ctx == NULL ||
+        f->state->rt == NULL) {
+
+        return JS_ThrowTypeError(
+            ctx,
+            "context closed"
+        );
+    }
+
+    if (f->state->ctx != ctx) {
+
+        return JS_ThrowTypeError(
+            ctx,
+            "function belongs to another context"
+        );
+    }
+
+    return JS_DupValue(
+        ctx,
+        f->func_val
+    );
+}
+
+
 static JSValue mp_to_quickjs(
     JSContext *ctx,
     mp_obj_t obj,
@@ -2788,6 +3307,26 @@ static JSValue mp_to_quickjs(
             ctx,
             (const uint8_t *)bufinfo.buf,
             bufinfo.len
+        );
+    }
+
+
+    /* ---------------------------------------------------------------------- */
+    /* JS Function wrapper -> JS（pass-through）                               */
+    /* ---------------------------------------------------------------------- */
+
+    /*
+     * 阶段 4：识别 JS 函数 wrapper。同 Context 时 JS_DupValue 传回 JS；
+     * 跨 Context / context closed 设 JS 异常并返回 JS_EXCEPTION。
+     */
+    if (mp_obj_is_type(
+            obj,
+            &quickjs_function_type
+        )) {
+
+        return quickjs_function_pass_through(
+            ctx,
+            obj
         );
     }
 
@@ -3346,6 +3885,53 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR(
     mod_quickjs_call_obj,
     1,
     mod_quickjs_call
+);
+
+
+/* ========================================================================= */
+/*                         quickjs.run_jobs() / has_pending_jobs()            */
+/* ========================================================================= */
+
+/*
+ * 默认 singleton 的 job queue 泵（阶段 4）。
+ * 与 Context 的 run_jobs() 共享同一实现；state=NULL 表示 singleton。
+ * 保持 quickjs.init() 自动初始化语义。
+ */
+static mp_obj_t mod_quickjs_run_jobs(void) {
+
+    if (rt == NULL ||
+        ctx == NULL) {
+
+        mod_quickjs_init();
+    }
+
+    return quickjs_run_jobs_helper(
+        NULL
+    );
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_0(
+    mod_quickjs_run_jobs_obj,
+    mod_quickjs_run_jobs
+);
+
+
+static mp_obj_t mod_quickjs_has_pending_jobs(void) {
+
+    if (rt == NULL ||
+        ctx == NULL) {
+
+        mod_quickjs_init();
+    }
+
+    return mp_obj_new_bool(
+        JS_IsJobPending(rt)
+    );
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_0(
+    mod_quickjs_has_pending_jobs_obj,
+    mod_quickjs_has_pending_jobs
 );
 
 
@@ -3916,6 +4502,93 @@ static MP_DEFINE_CONST_FUN_OBJ_1(
 
 
 /* -------------------------------------------------------------------------- */
+/* Context._js_mem()（调试：QuickJS 堆用量）                                    */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * 返回当前 runtime 的 QuickJS 堆用量（JS_ComputeMemoryUsage 的
+ * memory_used_size，字节）。调试用途：验证无 JS 堆泄漏时用
+ * “创建 N 个 context 后新 context 的堆用量与基线差 0” 来判断。
+ */
+static mp_obj_t mod_quickjs_ctx_js_mem(
+    mp_obj_t self_in
+) {
+    quickjs_ctx_t *state =
+        quickjs_ctx_check_open(self_in);
+
+    JSMemoryUsage usage;
+    memset(&usage, 0, sizeof(usage));
+
+    JS_ComputeMemoryUsage(
+        state->rt,
+        &usage
+    );
+
+    return mp_obj_new_int_from_ll(
+        (long long)usage.memory_used_size
+    );
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_1(
+    mod_quickjs_ctx_js_mem_obj,
+    mod_quickjs_ctx_js_mem
+);
+
+
+/* -------------------------------------------------------------------------- */
+/* Context.run_jobs() / has_pending_jobs()                                    */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * Python:
+ *
+ *     n = ctx.run_jobs()
+ *
+ * 泵出当前 Runtime 的 pending jobs（Promise microtasks / .then / async）。
+ * 返回执行的 job 数量；无 job 返回 0。job 执行错误（含超时中断）转成
+ * Python 异常。
+ *
+ *     ctx.has_pending_jobs() -> bool
+ *
+ * 是否有尚未执行的 job（JS_IsJobPending）。
+ */
+static mp_obj_t mod_quickjs_ctx_run_jobs(
+    mp_obj_t self_in
+) {
+    quickjs_ctx_t *state =
+        quickjs_ctx_check_open(self_in);
+
+    return quickjs_run_jobs_helper(
+        state
+    );
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_1(
+    mod_quickjs_ctx_run_jobs_obj,
+    mod_quickjs_ctx_run_jobs
+);
+
+
+static mp_obj_t mod_quickjs_ctx_has_pending_jobs(
+    mp_obj_t self_in
+) {
+    quickjs_ctx_t *state =
+        quickjs_ctx_check_open(self_in);
+
+    return mp_obj_new_bool(
+        JS_IsJobPending(
+            state->rt
+        )
+    );
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_1(
+    mod_quickjs_ctx_has_pending_jobs_obj,
+    mod_quickjs_ctx_has_pending_jobs
+);
+
+
+/* -------------------------------------------------------------------------- */
 /* Context.set_memory_limit()                                                 */
 /* -------------------------------------------------------------------------- */
 
@@ -4092,6 +4765,27 @@ quickjs_context_locals_dict_table[] = {
     },
 
     {
+        MP_ROM_QSTR(MP_QSTR__js_mem),
+        MP_ROM_PTR(
+            &mod_quickjs_ctx_js_mem_obj
+        )
+    },
+
+    {
+        MP_ROM_QSTR(MP_QSTR_run_jobs),
+        MP_ROM_PTR(
+            &mod_quickjs_ctx_run_jobs_obj
+        )
+    },
+
+    {
+        MP_ROM_QSTR(MP_QSTR_has_pending_jobs),
+        MP_ROM_PTR(
+            &mod_quickjs_ctx_has_pending_jobs_obj
+        )
+    },
+
+    {
         MP_ROM_QSTR(MP_QSTR_set_memory_limit),
         MP_ROM_PTR(
             &mod_quickjs_ctx_set_memory_limit_obj
@@ -4145,6 +4839,12 @@ static mp_obj_t mod_quickjs_help(void) {
         "  quickjs.call(name, *args)\n"
         "      Call a global JavaScript function\n"
 
+        "  quickjs.run_jobs()\n"
+        "      Execute pending JS jobs (promise microtasks); returns count\n"
+
+        "  quickjs.has_pending_jobs()\n"
+        "      True if there are unexecuted JS jobs\n"
+
         "  quickjs.version()\n"
         "      Return QuickJS-NG engine version\n"
 
@@ -4176,6 +4876,15 @@ static mp_obj_t mod_quickjs_help(void) {
         "  ctx.gc()\n"
         "      Run the QuickJS garbage collector\n"
 
+        "  ctx._js_mem()\n"
+        "      Debug: return QuickJS heap usage in bytes\n"
+
+        "  ctx.run_jobs()\n"
+        "      Execute pending JS jobs (promise microtasks); returns count\n"
+
+        "  ctx.has_pending_jobs()\n"
+        "      True if there are unexecuted JS jobs\n"
+
         "  ctx.set_memory_limit(bytes)\n"
         "      Set the JS heap limit (0 = unlimited)\n"
 
@@ -4204,6 +4913,8 @@ static mp_obj_t mod_quickjs_help(void) {
         "  Array     -> list\n"
         "  Object    -> dict\n"
         "  Function  -> Python callable (Context)\n"
+        "  Promise   -> Promise wrapper (Context): p.done() / p.result()\n"
+        "      p.result(): value, or raises the rejection / 'not settled'\n"
 
         "\n"
 
@@ -4284,6 +4995,20 @@ quickjs_module_globals_table[] = {
         MP_ROM_QSTR(MP_QSTR_call),
         MP_ROM_PTR(
             &mod_quickjs_call_obj
+        )
+    },
+
+    {
+        MP_ROM_QSTR(MP_QSTR_run_jobs),
+        MP_ROM_PTR(
+            &mod_quickjs_run_jobs_obj
+        )
+    },
+
+    {
+        MP_ROM_QSTR(MP_QSTR_has_pending_jobs),
+        MP_ROM_PTR(
+            &mod_quickjs_has_pending_jobs_obj
         )
     },
 

@@ -57,9 +57,16 @@ import quickjs
 quickjs.init()            # idempotent
 quickjs.eval("1 + 2")     # -> 3
 quickjs.call("add", 1, 2)
+quickjs.run_jobs()        # execute pending JS jobs (promise microtasks)
+quickjs.has_pending_jobs()  # -> bool
 quickjs.version()         # -> "0.16.1"
 quickjs.help()
 ```
+
+Note: the singleton has no `Context` opaque, so `eval()` of a JS `Function`
+or `Promise` *value* raises `TypeError: unsupported QuickJS value type`
+(consistent with how it has always handled functions); side effects and the
+job queue still work normally.
 
 ### Context (isolated runtime)
 
@@ -72,8 +79,11 @@ ctx.get("answer")              # None if missing
 ctx.set("config", {"name": "MicroPython", "items": [1,2,3]})
 
 ctx.gc()                       # run the JS garbage collector
+ctx.run_jobs()                 # execute pending JS jobs; returns count
+ctx.has_pending_jobs()         # -> bool
 ctx.set_memory_limit(128*1024) # JS heap limit, 0 = unlimited
 ctx.set_max_stack_size(256*1024) # JS stack limit, 0 = unlimited (default 1 MiB)
+ctx._js_mem()                  # debug: JS heap usage in bytes
 
 ctx.close()                    # free runtime; idempotent
 ```
@@ -144,6 +154,85 @@ interrupt handler only reads the clock and sets a flag (no MicroPython
 API calls, no GC). The timeout state is per-execution and never poisons
 the Context.
 
+## Promises & the job queue
+
+QuickJS runs promise microtasks in a host-pumped job queue. `eval()`/`call()`
+are synchronous and never block on a promise; instead:
+
+- `ctx.run_jobs()` drains the current runtime's pending jobs (microtasks from
+  `.then`/`.catch`/`.finally`/async) and returns how many jobs ran
+  (`0` when nothing is pending). A job that fails (e.g. the execution
+  timeout interrupt) raises a MicroPython exception.
+- `ctx.has_pending_jobs()` reports whether the queue is non-empty.
+
+```python
+ctx.eval("""
+    Promise.resolve(1)
+        .then(x => x + 1)
+        .then(x => globalThis.result = x)
+""")
+ctx.run_jobs()
+assert ctx.get("result") == 2
+```
+
+`ctx.eval()`/`ctx.get()` of a JS `Promise` returns a **Promise wrapper**
+(the same lifetime model as the function wrapper — it holds a strong
+reference to the Context, so it never dangles):
+
+```python
+p = ctx.eval("Promise.resolve(42)")
+p.done()                 # -> bool: settled (fulfilled or rejected)?
+p.result()               # -> 42  (raises the rejection, or RuntimeError if pending)
+```
+
+- `p.result()` on a fulfilled promise converts the value as usual
+  (object/array/bytes/etc.).
+- On a **rejected** promise it raises the rejection as a MicroPython
+  `RuntimeError` (`name: message` + `stack` for `Error` reasons, like any
+  other JS error). Non-Error reasons (`Promise.reject("oops")`) are
+  stringified.
+- On a still-**pending** promise it raises
+  `RuntimeError("promise not settled; call ctx.run_jobs()")`.
+
+```python
+p = ctx.eval("Promise.resolve(1).then(() => { throw new Error('failure'); })")
+ctx.run_jobs()           # the reaction job runs; the derived promise is rejected
+p.result()               # raises RuntimeError: Error: failure
+```
+
+Notes:
+- A rejection is *state*, not an execution error: `run_jobs()` only raises
+  for real JS failures (uncatchable errors / timeout / OOM).
+- The timeout covers the job queue too: a microtask that spins forever is
+  interrupted and surfaces as `JavaScript execution timeout`; the Context
+  stays reusable.
+- After `ctx.close()`, `done()`/`result()` raise
+  `RuntimeError("context closed")`; the wrapper never touches a dangling
+  JS value.
+
+## Function wrapper pass-through
+
+A JS function wrapper obtained from one Context can be handed back into the
+*same* Context — via `ctx.set()`, as a callback return value, or nested in a
+`list`/`dict`:
+
+```python
+ctx.eval("function mul(a, b){ return a * b; }")
+mul = ctx.get("mul")
+ctx.set("mul2", mul)           # pass-through: same context
+assert ctx.eval("mul2(6, 7)") == 42
+
+def pick():
+    return mul                 # callback returning a JS function wrapper
+ctx.add_callable("pick", pick)
+assert ctx.eval("pick()(3, 4)") == 12
+```
+
+Crossing contexts is rejected — a wrapper from `ctx1` passed into `ctx2`
+raises `RuntimeError: TypeError: function belongs to another context` (the
+underlying JSValue is never moved between runtimes). A wrapper whose Context
+was closed raises `context closed`.
+
 ## Type conversions
 
 | MicroPython | JS |
@@ -158,6 +247,7 @@ the Context.
 | `bytes` | `ArrayBuffer` |
 | `bytearray` | `Uint8Array` |
 | Python callable | `Function` (via `add_callable`) |
+| JS Function wrapper | its `Function` (same Context only; cross-Context → error) |
 
 | JS | MicroPython |
 |---|---|
@@ -171,6 +261,7 @@ the Context.
 | `Uint8Array` | `bytes` |
 | `BigInt` (int64 range) | `int` |
 | `Function` | Python callable wrapper |
+| `Promise` | Promise wrapper (`done()` / `result()`) |
 
 `bytes` / `ArrayBuffer` / `bytearray` / `Uint8Array` conversions are **copy
 semantics** — no borrowed pointers in either direction, so the Python object
@@ -178,7 +269,6 @@ and the JS value never alias.
 
 ### Not supported (yet)
 
-- Promise / async bridging
 - JS `this` binding for wrappers (calls pass `JS_UNDEFINED`)
 - `Uint8Array` is the only supported TypedArray; others raise
   `TypeError: unsupported typed array`
@@ -186,6 +276,8 @@ and the JS value never alias.
 - `BigInt` outside int64 range -> raises `TypeError: BigInt out of range`
   (never silently converted to float or truncated)
 - Python `int` -> JS BigInt (Python ints stay int32/float64)
+- Python-side promise construction / `p.then(cb)` on the wrapper
+  (promise chains are written in JS; the wrapper is read-only)
 
 ### Exceptions
 
@@ -217,6 +309,7 @@ micropython tests/test_quickjs_phase0.py   # baseline conversions + API
 micropython tests/test_quickjs_phase1.py   # Context lifecycle / GC
 micropython tests/test_quickjs_phase2.py   # depth/cycles, binary, BigInt, errors
 micropython tests/test_quickjs_phase3.py   # function bridge + timeout
+micropython tests/test_quickjs_phase4.py   # promise/job queue + pass-through + lifecycle
 ```
 
 ## Layout
