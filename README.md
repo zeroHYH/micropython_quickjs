@@ -175,11 +175,18 @@ ctx.set_time_limit(0)
 assert ctx.eval("1 + 2") == 3   # context is reusable after a timeout
 ```
 
-The timeout covers `eval`, `call`, and function-wrapper calls. It is
-implemented with `JS_SetInterruptHandler` + `mp_hal_ticks_ms()`; the
-interrupt handler only reads the clock and sets a flag (no MicroPython
-API calls, no GC). The timeout state is per-execution and never poisons
-the Context.
+The timeout covers `eval`, `call`, `run_jobs`, promise methods and
+function-wrapper calls. It is implemented with `JS_SetInterruptHandler` +
+`mp_hal_ticks_ms()`; the interrupt handler only reads the clock and sets a
+flag (no MicroPython API calls, no GC). The timeout state is per-execution
+and never poisons the Context.
+
+JS execution can nest (an outer `eval`/`call` runs a Python callback,
+which re-enters the Context with another `eval`). Nested windows **share
+the outermost window's budget**: an inner `eval` never resets or cancels
+the outer deadline, so an infinite outer loop cannot escape the timeout by
+re-entering the Context from a callback. When the interrupt fires inside an
+inner window, the whole call chain unwinds with a timeout error.
 
 ## Promises & the job queue
 
@@ -394,6 +401,15 @@ stack:
   lists/dicts/JS arrays/objects raise
   `RuntimeError: circular reference detected`. Shared (non-circular)
   references such as `[x, x]` are *not* misdetected.
+- **Conversion failures never leak**: every failure during
+  MicroPython → JS conversion (unsupported type, out-of-range integer,
+  buffer error, …) surfaces as a JS-style exception (`RuntimeError:
+  TypeError: <Python error>`, e.g. a raw `10**300` argument raises
+  `RuntimeError: TypeError: OverflowError: overflow converting long int
+  to machine word`) instead of a raw MicroPython exception jumping out in
+  the middle of the conversion. Use `quickjs.bigint()` for huge integers.
+  Partially built arguments/containers are released on all such paths, so
+  the Context closes cleanly afterwards.
 
 ## Tests
 
@@ -406,6 +422,7 @@ micropython tests/test_quickjs_phase2.py   # depth/cycles, binary, BigInt, error
 micropython tests/test_quickjs_phase3.py   # function bridge + timeout
 micropython tests/test_quickjs_phase4.py   # promise/job queue + pass-through + lifecycle
 micropython tests/test_quickjs_phase5.py   # reentrancy, promise bridging, this, TypedArray, bigint, GC/lifetime
+micropython tests/test_quickjs_phase6.py   # execution safety: nested timeout budget, conversion ownership, contamination
 ```
 
 ## Layout

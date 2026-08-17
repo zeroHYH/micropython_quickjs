@@ -237,6 +237,24 @@ typedef struct _quickjs_ctx_t {
     bool timeout_triggered;
 
     /*
+     * 阶段 6：活跃超时窗口计数（arm 之后、finish 之前的窗口数）。
+     *
+     * JS 执行可嵌套（外层 eval/call -> Python callback -> 内层 eval），
+     * 每个执行段都 arm/finish 超时窗口。内层窗口必须共享外层 deadline：
+     * 若内层 arm 重新设置 deadline、内层 finish 清除窗口，外层无限循环
+     * 会通过回调里的内层 eval 不断“重置”超时预算而永远不被中断。
+     *
+     * 规则：
+     *   - 只有最外层窗口（depth 0 -> 1）设定 deadline、清零 triggered；
+     *   - 内层窗口（depth > 0）不改变 deadline/triggered（共享预算）；
+     *   - 只有最外层窗口 finish（depth 1 -> 0）才清除 deadline/triggered，
+     *     超时状态不污染后续调用；
+     *   - 任意窗口 finish 都返回当前 triggered（超时中断可能在任意
+     *     嵌套窗口的字节码执行期间触发）。
+     */
+    unsigned timeout_depth;
+
+    /*
      * 阶段 5：重入保护执行深度。
      * 所有可能进入 QuickJS 执行栈的 Python 入口（eval/call/get/set/
      * add_callable/run_jobs/Function wrapper 调用/Promise 方法）在执行期间
@@ -338,6 +356,15 @@ static mp_obj_t quickjs_to_mp_obj(
 );
 
 static JSValue mp_to_quickjs(
+    JSContext *ctx,
+    mp_obj_t obj,
+    quickjs_convert_state_t *st
+);
+
+/*
+ * 阶段 6：mp_to_quickjs 的裸实现（参见 mp_to_quickjs 自身的说明）。
+ */
+static JSValue mp_to_quickjs_impl(
     JSContext *ctx,
     mp_obj_t obj,
     quickjs_convert_state_t *st
@@ -1606,7 +1633,8 @@ static int quickjs_interrupt_handler(
 
 /*
  * 每次 JS 执行（eval/call/函数 wrapper 调用）开始前调用：
- * 若启用了 timeout，设置 deadline 并清零 triggered。
+ * 若启用了 timeout，打开一个超时窗口。窗口可嵌套（X）
+ * （外层执行 -> Python callback -> 内层执行），见 timeout_depth 注释。
  */
 static void quickjs_ctx_arm_timeout(
     quickjs_ctx_t *state
@@ -1617,17 +1645,25 @@ static void quickjs_ctx_arm_timeout(
         return;
     }
 
-    state->deadline_ms =
-        mp_hal_ticks_ms() +
-        state->timeout_ms;
+    if (state->timeout_depth == 0) {
 
-    state->timeout_triggered = false;
+        /* 最外层窗口：设定本次（整条调用链）的超时预算 */
+        state->deadline_ms =
+            mp_hal_ticks_ms() +
+            state->timeout_ms;
+
+        state->timeout_triggered = false;
+    }
+
+    state->timeout_depth++;
 }
 
 
 /*
- * JS 执行结束后调用：返回是否本次执行触发了超时，
- * 并清除 deadline / triggered（超时状态不污染后续调用）。
+ * JS 执行结束后调用：关闭一个超时窗口。
+ * 返回当前 triggered（本次执行的快速路径是否触发过超时中断）。
+ * 只有最外层窗口关闭时才清除 deadline / triggered（见 timeout_depth
+ * 注释）——超时状态不污染后续调用，但嵌套执行共享同一预算。
  */
 static bool quickjs_ctx_finish_timeout(
     quickjs_ctx_t *state
@@ -1639,8 +1675,15 @@ static bool quickjs_ctx_finish_timeout(
     bool t =
         state->timeout_triggered;
 
-    state->timeout_triggered = false;
-    state->deadline_ms = 0;
+    if (state->timeout_depth > 0) {
+        state->timeout_depth--;
+    }
+
+    if (state->timeout_depth == 0) {
+
+        state->timeout_triggered = false;
+        state->deadline_ms = 0;
+    }
 
     return t;
 }
@@ -4653,7 +4696,96 @@ MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(
 );
 
 
+/*
+ * MP -> JS 转换的根入口。
+ *
+ * 阶段 6：把转换过程中抛出的任何 MicroPython 异常（例如
+ * mp_obj_get_int 对超出 mp_int_t 的大整数抛 OverflowError）转成
+ * JS 异常返回，而不是让 nlr 长跳越过失配的清理点直接逃逸。
+ *
+ * 转换层的不变量（各处注释反复强调）是：“MP -> JS 方向失败设 JS
+ * 异常，不抛 Python 异常”——只有少数叶子转换（mp_obj_get_int 等）
+ * 真正抛出，本包装器恢复这个不变量：所有调用方既有的
+ * JS_IsException 清理路径（释放已转换参数 / this_val / 部分构建的
+ * 容器 / set 的 global 对象）都能执行，不再泄漏 JSValue。容器/循环
+ * 检测 tracker 的 pop 也由各自的清理路径完成，保持平衡。
+ */
 static JSValue mp_to_quickjs(
+    JSContext *qctx,
+    mp_obj_t obj,
+    quickjs_convert_state_t *st
+) {
+    nlr_buf_t nlr;
+
+    if (nlr_push(&nlr) == 0) {
+
+        JSValue result =
+            mp_to_quickjs_impl(
+                qctx,
+                obj,
+                st
+            );
+
+        nlr_pop();
+
+        return result;
+    }
+
+
+    /*
+     * 转换中途抛出的 Python 异常 -> JS 异常（带类型名和消息）。
+     * 消息提取用第二层 nlr 保护（str(exc) 自身可能抛异常）。
+     */
+    mp_obj_t exc =
+        (mp_obj_t)nlr.ret_val;
+
+    const char *type_name =
+        mp_obj_get_type_str(exc);
+
+    const char *msg = NULL;
+
+    nlr_buf_t nlr2;
+
+    if (nlr_push(&nlr2) == 0) {
+
+        mp_obj_t args_arr[1];
+        args_arr[0] = exc;
+
+        mp_obj_t s =
+            (mp_obj_t)mp_obj_str_make_new(
+                &mp_type_str,
+                1,
+                0,
+                args_arr
+            );
+
+        msg =
+            mp_obj_str_get_str(s);
+
+        nlr_pop();
+
+    } else {
+
+        msg = NULL;
+    }
+
+    JS_ThrowTypeError(
+        qctx,
+        "%s: %s",
+        type_name,
+        (msg != NULL)
+            ? msg
+            : "conversion error"
+    );
+
+    return JS_EXCEPTION;
+}
+
+
+/*
+ * MP -> JS 转换的裸实现。必须经由 mp_to_quickjs 调用（见其说明）。
+ */
+static JSValue mp_to_quickjs_impl(
     JSContext *ctx,
     mp_obj_t obj,
     quickjs_convert_state_t *st
