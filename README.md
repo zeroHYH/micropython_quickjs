@@ -108,7 +108,9 @@ isolated between contexts. `close()` is the primary release path; a
 `__del__` finaliser also runs when `MICROPY_ENABLE_FINALISER` is enabled,
 but never rely on it alone.
 
-After `close()`, every Context method raises `RuntimeError("context closed")`.
+After `close()`, every Context method except `close()` itself (which is
+idempotent: a second `close()` is a no-op) raises
+`RuntimeError("context closed")`.
 
 While a JS call is executing (a Python callback is on the C stack, or a
 microtask is running), calling `ctx.close()` raises

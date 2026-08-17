@@ -218,9 +218,6 @@ typedef struct _quickjs_ctx_t {
 
     bool closed;
 
-    size_t memory_limit;
-    size_t max_stack_size;
-
     /* 回指 Context 对象（后续阶段回调/函数包装注册表会用到）。 */
     mp_obj_t self_obj;
 
@@ -6867,10 +6864,6 @@ static mp_obj_t quickjs_context_make_new(
         state->rt = rt;
         state->ctx = qctx;
         state->closed = false;
-        state->memory_limit =
-            QUICKJS_DEFAULT_MEMORY_LIMIT;
-        state->max_stack_size =
-            0; /* 0 = 使用 QuickJS 默认（1 MiB） */
         state->self_obj =
             MP_OBJ_FROM_PTR(obj);
 
@@ -7857,9 +7850,6 @@ static mp_obj_t mod_quickjs_ctx_set_memory_limit(
     }
 
 
-    state->memory_limit =
-        (size_t)limit;
-
     /*
      * JS_SetMemoryLimit() 是 void，对 runtime 立即生效。
      * 0 = 无限制。
@@ -7906,9 +7896,6 @@ static mp_obj_t mod_quickjs_ctx_set_max_stack_size(
         );
     }
 
-
-    state->max_stack_size =
-        (size_t)limit;
 
     /*
      * JS_SetMaxStackSize() 是 void，对 runtime 立即生效。
