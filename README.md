@@ -647,7 +647,7 @@ globalThis.calc = mul(6, 7);
 """)
 assert ctx.get("calc") == 42
 
-### Built-in Web APIs (`TextEncoder`, `TextDecoder`, `btoa`, `atob`, `performance.now`)
+### Built-in Web APIs (`TextEncoder`, `TextDecoder`, `btoa`, `atob`, `performance.now`, `crypto`, `URL`)
 
 Web standard utility APIs are available out of the box in all JavaScript environments:
 
@@ -666,6 +666,74 @@ const orig = atob(b64);                 // -> "admin:secret"
 const t0 = performance.now();
 // ... computation ...
 const elapsed = performance.now() - t0;
+
+// 4. Web Crypto (hardware random bytes & v4 UUID)
+const randBuf = new Uint8Array(16);
+crypto.getRandomValues(randBuf);
+const uuid = crypto.randomUUID();       // -> "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+
+// 5. URL & URLSearchParams
+const u = new URL("https://host.local:8080/api/sensor?device=esp32&rate=100#top");
+console.log(u.hostname);                // "host.local"
+console.log(u.searchParams.get("rate")); // "100"
+```
+
+### Built-in `std` Module & VFS File I/O
+
+Standard system helpers and file I/O integrated with MicroPython's Virtual File System:
+
+```javascript
+// 1. File Read & Write via MicroPython VFS
+std.writeFile("/sd/config.json", JSON.stringify({ rate: 50 }));
+const configText = std.loadFile("/sd/config.json");
+
+// 2. Load and execute an external JS file
+std.loadScript("scripts/driver.js");
+
+// 3. Formatted printing & C-style sprintf
+const msg = std.sprintf("Sensor ID: %04x, Temp: %.1f C", 42, 26.5);
+std.printf("Message: %s\n", msg);
+std.puts("Simple log line");
+
+// 4. QuickJS Garbage Collection & Environment Variables
+std.gc();
+std.setenv("DEVICE_ID", "NODE_01");
+const id = std.getenv("DEVICE_ID");
+```
+
+### `bjson` (Binary JSON) Serialization
+
+Fast, compact binary object serialization in both JavaScript and MicroPython:
+
+```python
+import quickjs
+
+ctx = quickjs.Context()
+
+# In JavaScript:
+# const bin = bjson.write({ temp: 25.4, active: true });
+# const obj = bjson.read(bin);
+
+# In Python:
+data = {"device": "esp32", "readings": [1.1, 2.2, 3.3]}
+bin_bytes = ctx.bjson_encode(data)      # -> bytes
+restored = ctx.bjson_decode(bin_bytes)  # -> dict
+assert restored == data
+```
+
+### Memory Profiling & Breakdown (`memory_stats`)
+
+Detailed diagnostics for analyzing memory usage across atoms, objects, bytecode, and strings:
+
+```python
+import quickjs
+
+ctx = quickjs.Context()
+stats = ctx.memory_stats()
+
+print("Memory Used:", stats["memory_used_size"], "bytes")
+print("Atoms:", stats["atoms_count"], "Objects:", stats["objects_count"])
+print("Bytecode:", stats["js_func_code_size"], "bytes")
 ```
 
 ### Fast JSON Evaluation (`eval_json`)
@@ -748,14 +816,17 @@ ctx.repl()
 
 - **Features**:
   - Native line editing, history, and arrow key support via MicroPython's `readline`.
+  - **`_` Variable**: Automatically caches the result of the last evaluated expression in `globalThis._`.
   - Multiline statement detection: unclosed `{`, `(`, `[`, template literals, and strings automatically prompt with `... `.
   - Async Promise evaluation: automatically runs microtask jobs (`run_jobs()`) and formats `Promise { <fulfilled>: ... }`.
   - Dot commands:
     - `.help` : Show REPL commands
+    - `.x` / `.dec` : Switch integer display between Hexadecimal (`0x...`) and Decimal
+    - `.depth <n>` : Set object inspection traversal depth
     - `.load <file.js>` : Load and evaluate an external script file
     - `.time <code...>` : Benchmark execution time in microseconds
     - `.version`: Print engine version
-    - `.mem`  : View JS heap memory usage
+    - `.mem`  : View detailed JS heap memory breakdown
     - `.gc`   : Run JavaScript garbage collection
     - `.clear`: Reset context state
     - `.exit` / `.quit` (or press `Ctrl+D`): Return to MicroPython
@@ -777,6 +848,8 @@ micropython tests/test_bytecode.py     # bytecode compilation, execution, cross-
 micropython tests/test_module.py       # ES module evaluation, Python loader, VFS import
 micropython tests/test_console.py      # built-in console logging and formatting
 micropython tests/test_web.py          # Web standard APIs (TextEncoder/Decoder, btoa/atob, performance) & fast JSON
+micropython tests/test_tooling.py      # detailed memory_stats breakdown and bjson serialization
+micropython tests/test_sys_web.py      # crypto (random/UUID), std module file I/O, URL & URLSearchParams
 micropython tests/test_asyncio.py      # asyncio event loop cooperative promise waiting
 micropython tests/test_lifecycle.py    # lifecycle, multiple contexts, OOM & stress
 ```
@@ -792,19 +865,21 @@ modquickjs.c          module registration & singleton API entry points
 qjs_context.c         quickjs.Context() instance management & methods
 qjs_exec.c            execution engine, bytecode helpers, timeout interrupt & job queue
 qjs_module.c          ES module evaluation, VFS bridge & custom Python loader callback
-qjs_repl.c            built-in interactive C REPL via shared/readline
+qjs_repl.c            built-in interactive C REPL (with _, .x, .dec, .depth, .load, .time)
 qjs_console.c         built-in console object (log, warn, error, info, debug)
-qjs_web.c             Web standard APIs (TextEncoder/Decoder, btoa/atob, performance) & fast JSON
+qjs_std.c             QuickJS standard library (std module, bjson, eval_json, memory_stats)
+qjs_web.c             Web standard APIs (TextEncoder/Decoder, btoa/atob, crypto, URL, performance)
 qjs_convert.c         bidirectional JS <-> MicroPython type conversion (incl. Symbol, Date, RegExp, Map, Set)
 qjs_error.c           unified error handling & exception formatting
 qjs_callback.c        Python callable -> JS CClosure callback registry
 qjs_promise.c         Promise wrapper, then/catch/finally_ chaining & resolver
 qjs_func.c            Function wrapper, call/this binding & pass-through
 qjs_bigint.c          arbitrary precision BigInt marker & conversions
-tests/                functional test suites (test_basic, test_convert, test_function, test_promise, test_bytecode, test_module, test_console, test_web, test_asyncio, test_lifecycle, run_all.py)
+tests/                functional test suites (12 suites + test runner run_all.py)
 src/                  generated: QuickJS-NG fetched from GitHub (git-ignored)
 ```
 
 ## License
 
 MIT (QuickJS-NG is MIT).
+

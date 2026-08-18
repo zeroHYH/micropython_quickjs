@@ -1,4 +1,7 @@
 #include "modquickjs.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 /* -------------------------------------------------------------------------- */
 /* Base64 btoa / atob Implementation                                          */
@@ -211,6 +214,61 @@ static JSValue js_performance_now(JSContext *ctx, JSValueConst this_val,
 }
 
 /* -------------------------------------------------------------------------- */
+/* crypto (getRandomValues & randomUUID)                                      */
+/* -------------------------------------------------------------------------- */
+
+static JSValue js_crypto_get_random_values(JSContext *ctx,
+                                           JSValueConst this_val, int argc,
+                                           JSValueConst *argv) {
+  (void)this_val;
+  if (argc < 1) {
+    return JS_ThrowTypeError(ctx, "getRandomValues requires TypedArray");
+  }
+  size_t size = 0, off = 0, len = 0, bpe = 0;
+  uint8_t *data = NULL;
+  JSValue abuf = JS_GetTypedArrayBuffer(ctx, argv[0], &off, &len, &bpe);
+  if (!JS_IsException(abuf)) {
+    data = JS_GetArrayBuffer(ctx, &size, abuf);
+    JS_FreeValue(ctx, abuf);
+  }
+  if (data == NULL) {
+    return JS_ThrowTypeError(ctx, "Expected TypedArray for getRandomValues");
+  }
+  size_t byte_len = len * bpe;
+  uint8_t *ptr = data + off;
+  uint32_t seed = (uint32_t)mp_hal_ticks_us();
+  for (size_t i = 0; i < byte_len; i++) {
+    seed = seed * 1664525u + 1013904223u;
+    ptr[i] = (uint8_t)((seed >> 16) ^ (seed & 0xFF));
+  }
+  return JS_DupValue(ctx, argv[0]);
+}
+
+static JSValue js_crypto_random_uuid(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv) {
+  (void)this_val;
+  (void)argc;
+  (void)argv;
+  uint8_t bytes[16];
+  uint32_t seed = (uint32_t)mp_hal_ticks_us();
+  for (int i = 0; i < 16; i++) {
+    seed = seed * 1664525u + 1013904223u;
+    bytes[i] = (uint8_t)((seed >> 16) ^ (seed & 0xFF));
+  }
+  bytes[6] = (bytes[6] & 0x0F) | 0x40; /* version 4 */
+  bytes[8] = (bytes[8] & 0x3F) | 0x80; /* variant 1 */
+
+  char uuid[37];
+  snprintf(uuid, sizeof(uuid),
+           "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%"
+           "02x",
+           bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+           bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12],
+           bytes[13], bytes[14], bytes[15]);
+  return JS_NewStringLen(ctx, uuid, 36);
+}
+
+/* -------------------------------------------------------------------------- */
 /* Web API Initialization                                                     */
 /* -------------------------------------------------------------------------- */
 
@@ -255,29 +313,78 @@ void quickjs_init_web_apis(JSContext *ctx) {
                     JS_NewCFunction(ctx, js_performance_now, "now", 0));
   JS_SetPropertyStr(ctx, global, "performance", perf);
 
+  /* crypto */
+  JSValue crypto = JS_NewObject(ctx);
+  JS_SetPropertyStr(
+      ctx, crypto, "getRandomValues",
+      JS_NewCFunction(ctx, js_crypto_get_random_values, "getRandomValues", 1));
+  JS_SetPropertyStr(
+      ctx, crypto, "randomUUID",
+      JS_NewCFunction(ctx, js_crypto_random_uuid, "randomUUID", 0));
+  JS_SetPropertyStr(ctx, global, "crypto", crypto);
+
+  /* URL & URLSearchParams lightweight bootstrap */
+  const char *url_bootstrap =
+      "(function(global){"
+      "class URLSearchParams {"
+      "  constructor(init='') {"
+      "    this._p = [];"
+      "    if(typeof init==='string') {"
+      "      if(init.startsWith('?')) init = init.slice(1);"
+      "      if(init) {"
+      "        for(const pair of init.split('&')) {"
+      "          const idx = pair.indexOf('=');"
+      "          const k = idx>=0 ? pair.slice(0,idx) : pair;"
+      "          const v = idx>=0 ? pair.slice(idx+1) : '';"
+      "          this._p.push([decodeURIComponent(k), decodeURIComponent(v)]);"
+      "        }"
+      "      }"
+      "    } else if(init && typeof init==='object') {"
+      "      for(const [k,v] of Object.entries(init)) {"
+      "        this._p.push([String(k), String(v)]);"
+      "      }"
+      "    }"
+      "  }"
+      "  get(n){ const p=this._p.find(([k])=>k===n); return p?p[1]:null; }"
+      "  set(n,v){ const i=this._p.findIndex(([k])=>k===n); if(i>=0) "
+      "this._p[i]=[n,String(v)]; else this._p.push([n,String(v)]); }"
+      "  append(n,v){ this._p.push([n,String(v)]); }"
+      "  has(n){ return this._p.some(([k])=>k===n); }"
+      "  delete(n){ this._p=this._p.filter(([k])=>k!==n); }"
+      "  toString(){ return "
+      "this._p.map(([k,v])=>`${encodeURIComponent(k)}=${encodeURIComponent(v)}`"
+      ")"
+      ".join('&'); }"
+      "}"
+      "class URL {"
+      "  constructor(url, base) {"
+      "    let f = String(url);"
+      "    if(base && !f.includes('://')) {"
+      "      f = base.replace(/\\/+$/, '') + '/' + f.replace(/^\\/+/, '');"
+      "    }"
+      "    const m = "
+      "f.match(/^(?:([a-zA-Z]+:))?(?:\\/\\/([^\\/?#:]+)(?::(\\d+))?)?([^?#]*)(?"
+      ":\\?([^#]*))?(?:#(.*))?$/);"
+      "    if(!m) throw new TypeError('Invalid URL');"
+      "    this.protocol = m[1] || '';"
+      "    this.hostname = m[2] || '';"
+      "    this.port = m[3] || '';"
+      "    this.host = this.port ? `${this.hostname}:${this.port}` : "
+      "this.hostname;"
+      "    this.pathname = m[4] || '/';"
+      "    this.search = m[5] ? `?${m[5]}` : '';"
+      "    this.hash = m[6] ? `#${m[6]}` : '';"
+      "    this.href = f;"
+      "    this.searchParams = new URLSearchParams(this.search);"
+      "  }"
+      "}"
+      "global.URLSearchParams = URLSearchParams;"
+      "global.URL = URL;"
+      "})(globalThis);";
+
+  JSValue bres = JS_Eval(ctx, url_bootstrap, strlen(url_bootstrap), "<web>",
+                         JS_EVAL_TYPE_GLOBAL);
+  JS_FreeValue(ctx, bres);
+
   JS_FreeValue(ctx, global);
-}
-
-/* -------------------------------------------------------------------------- */
-/* Fast JSON Evaluation Helper                                                */
-/* -------------------------------------------------------------------------- */
-
-mp_obj_t quickjs_eval_json_helper(quickjs_ctx_t *state, const char *json_str,
-                                  size_t len) {
-  JSContext *qctx = (state != NULL) ? state->ctx : ctx;
-  if (qctx == NULL) {
-    mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("context closed"));
-  }
-
-  JSValue val = JS_ParseJSON(qctx, json_str, len, "<json>");
-  if (JS_IsException(val)) {
-    quickjs_raise_exception(qctx, val);
-    return mp_const_none;
-  }
-
-  quickjs_convert_state_t st;
-  memset(&st, 0, sizeof(st));
-  mp_obj_t res = quickjs_to_mp_owned(qctx, val, val, &st);
-  JS_FreeValue(qctx, val);
-  return res;
 }

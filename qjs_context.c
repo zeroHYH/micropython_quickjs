@@ -58,6 +58,7 @@ mp_obj_t quickjs_context_make_new(const mp_obj_type_t *type, size_t n_args,
 
     quickjs_init_console(qctx);
     quickjs_init_web_apis(qctx);
+    quickjs_init_std_modules(qctx);
 
     self = MP_OBJ_FROM_PTR(obj);
 
@@ -702,6 +703,33 @@ mp_obj_t mod_quickjs_ctx_eval_json(mp_obj_t self_in, mp_obj_t json_str_obj) {
 static MP_DEFINE_CONST_FUN_OBJ_2(mod_quickjs_ctx_eval_json_obj,
                                  mod_quickjs_ctx_eval_json);
 
+mp_obj_t mod_quickjs_ctx_memory_stats(mp_obj_t self_in) {
+  quickjs_ctx_t *state = quickjs_ctx_check_open(self_in);
+  return quickjs_memory_stats_helper(state->rt);
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_1(mod_quickjs_ctx_memory_stats_obj,
+                                 mod_quickjs_ctx_memory_stats);
+
+mp_obj_t mod_quickjs_ctx_bjson_encode(mp_obj_t self_in, mp_obj_t obj) {
+  quickjs_ctx_t *state = quickjs_ctx_check_open(self_in);
+  return quickjs_bjson_encode_helper(state, obj);
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_2(mod_quickjs_ctx_bjson_encode_obj,
+                                 mod_quickjs_ctx_bjson_encode);
+
+mp_obj_t mod_quickjs_ctx_bjson_decode(mp_obj_t self_in, mp_obj_t bytes_obj) {
+  quickjs_ctx_t *state = quickjs_ctx_check_open(self_in);
+  mp_buffer_info_t bufinfo;
+  mp_get_buffer_raise(bytes_obj, &bufinfo, MP_BUFFER_READ);
+  return quickjs_bjson_decode_helper(state, (const uint8_t *)bufinfo.buf,
+                                     bufinfo.len);
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_2(mod_quickjs_ctx_bjson_decode_obj,
+                                 mod_quickjs_ctx_bjson_decode);
+
 static const mp_rom_map_elem_t quickjs_context_locals_dict_table[] = {
 
     {MP_ROM_QSTR(MP_QSTR___del__), MP_ROM_PTR(&mod_quickjs_ctx_close_obj)},
@@ -710,6 +738,15 @@ static const mp_rom_map_elem_t quickjs_context_locals_dict_table[] = {
 
     {MP_ROM_QSTR(MP_QSTR_eval_json),
      MP_ROM_PTR(&mod_quickjs_ctx_eval_json_obj)},
+
+    {MP_ROM_QSTR(MP_QSTR_bjson_encode),
+     MP_ROM_PTR(&mod_quickjs_ctx_bjson_encode_obj)},
+
+    {MP_ROM_QSTR(MP_QSTR_bjson_decode),
+     MP_ROM_PTR(&mod_quickjs_ctx_bjson_decode_obj)},
+
+    {MP_ROM_QSTR(MP_QSTR_memory_stats),
+     MP_ROM_PTR(&mod_quickjs_ctx_memory_stats_obj)},
 
     {MP_ROM_QSTR(MP_QSTR_call), MP_ROM_PTR(&mod_quickjs_ctx_call_obj)},
 

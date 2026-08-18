@@ -309,12 +309,25 @@ mp_obj_t mod_quickjs_ctx_set_module_loader(mp_obj_t self_in,
                                            mp_obj_t loader_obj);
 mp_obj_t mod_quickjs_ctx_repl(mp_obj_t self_in);
 mp_obj_t mod_quickjs_ctx_eval_json(mp_obj_t self_in, mp_obj_t json_str_obj);
+mp_obj_t mod_quickjs_ctx_memory_stats(mp_obj_t self_in);
+mp_obj_t mod_quickjs_ctx_bjson_encode(mp_obj_t self_in, mp_obj_t obj);
+mp_obj_t mod_quickjs_ctx_bjson_decode(mp_obj_t self_in, mp_obj_t bytes_obj);
 
 /* qjs_web.c */
 void quickjs_init_web_apis(JSContext *ctx);
+
+/* qjs_std.c */
+void quickjs_init_std_modules(JSContext *ctx);
 mp_obj_t quickjs_eval_json_helper(quickjs_ctx_t *state, const char *json_str,
                                   size_t len);
+mp_obj_t quickjs_bjson_encode_helper(quickjs_ctx_t *state, mp_obj_t obj);
+mp_obj_t quickjs_bjson_decode_helper(quickjs_ctx_t *state, const uint8_t *buf,
+                                     size_t len);
+mp_obj_t quickjs_memory_stats_helper(JSRuntime *qrt);
 mp_obj_t mod_quickjs_eval_json(mp_obj_t json_str_obj);
+mp_obj_t mod_quickjs_memory_stats(void);
+mp_obj_t mod_quickjs_bjson_encode(mp_obj_t obj);
+mp_obj_t mod_quickjs_bjson_decode(mp_obj_t bytes_obj);
 
 /* qjs_module.c */
 JSModuleDef *quickjs_module_loader_cb(JSContext *ctx, const char *module_name,

@@ -1,6 +1,7 @@
 #include "modquickjs.h"
 #include "py/reader.h"
 #include "shared/readline/readline.h"
+#include <stdlib.h>
 
 /* -------------------------------------------------------------------------- */
 /* Interactive C REPL Implementation                                          */
@@ -21,6 +22,8 @@ void quickjs_repl_run(quickjs_ctx_t *state) {
   vstr_t input_buf;
   vstr_init(&input_buf, 256);
   int indent_depth = 0;
+  bool hex_mode = false;
+  int print_depth = 2;
 
   for (;;) {
     const char *prompt =
@@ -55,17 +58,39 @@ void quickjs_repl_run(quickjs_ctx_t *state) {
         vstr_clear(&input_buf);
         break;
       } else if (strcmp(line_str, ".help") == 0) {
-        mp_printf(&mp_plat_print,
-                  "REPL Commands:\n"
-                  "  .help         Show this help message\n"
-                  "  .load <file>  Load and evaluate a JavaScript file\n"
-                  "  .time <code...> Benchmark execution time of JavaScript "
-                  "code\n"
-                  "  .mem          Print QuickJS heap usage\n"
-                  "  .gc           Run JavaScript garbage collector\n"
-                  "  .clear        Clear context state\n"
-                  "  .version      Show engine version\n"
-                  "  .exit         Exit REPL\n");
+        mp_printf(
+            &mp_plat_print,
+            "REPL Commands:\n"
+            "  .help         Show this help message\n"
+            "  .x            Hexadecimal number output\n"
+            "  .dec          Decimal number output\n"
+            "  .depth <n>    Set object inspection depth (current: %d)\n"
+            "  .load <file>  Load and evaluate a JavaScript file\n"
+            "  .time <code...> Benchmark execution time of JavaScript code\n"
+            "  .mem          Print detailed QuickJS heap usage\n"
+            "  .gc           Run JavaScript garbage collector\n"
+            "  .clear        Clear context state\n"
+            "  .version      Show engine version\n"
+            "  .exit         Exit REPL\n",
+            print_depth);
+      } else if (strcmp(line_str, ".x") == 0) {
+        hex_mode = true;
+        mp_printf(&mp_plat_print, "Hexadecimal output enabled.\n");
+      } else if (strcmp(line_str, ".dec") == 0) {
+        hex_mode = false;
+        mp_printf(&mp_plat_print, "Decimal output enabled.\n");
+      } else if (strncmp(line_str, ".depth", 6) == 0) {
+        const char *p = line_str + 6;
+        while (*p == ' ') {
+          p++;
+        }
+        if (*p != '\0') {
+          print_depth = atoi(p);
+          if (print_depth < 0) {
+            print_depth = 0;
+          }
+        }
+        mp_printf(&mp_plat_print, "Object inspection depth: %d\n", print_depth);
       } else if (strcmp(line_str, ".version") == 0) {
         mp_printf(&mp_plat_print, "QuickJS-NG version: %s\n", JS_GetVersion());
       } else if (strncmp(line_str, ".load ", 6) == 0) {
@@ -168,11 +193,19 @@ void quickjs_repl_run(quickjs_ctx_t *state) {
         if (state->rt != NULL) {
           JSMemoryUsage stats;
           JS_ComputeMemoryUsage(state->rt, &stats);
-          mp_printf(&mp_plat_print,
-                    "JS Heap Memory: %lu bytes (allocated: %lu bytes, "
-                    "objects: %ld)\n",
-                    (unsigned long)stats.memory_used_size,
-                    (unsigned long)stats.malloc_size, (long)stats.obj_count);
+          mp_printf(
+              &mp_plat_print,
+              "JS Memory Usage:\n"
+              "  Used: %lu bytes / Allocated: %lu bytes\n"
+              "  Atoms: %ld (%lu bytes) | Objects: %ld (%lu bytes)\n"
+              "  Strings: %ld (%lu bytes) | Functions: %ld (bytecode: %lu "
+              "bytes)\n",
+              (unsigned long)stats.memory_used_size,
+              (unsigned long)stats.malloc_size, (long)stats.atom_count,
+              (unsigned long)stats.atom_size, (long)stats.obj_count,
+              (unsigned long)stats.obj_size, (long)stats.str_count,
+              (unsigned long)stats.str_size, (long)stats.js_func_count,
+              (unsigned long)stats.js_func_code_size);
         }
       } else if (strcmp(line_str, ".gc") == 0) {
         if (state->rt != NULL) {
@@ -261,8 +294,12 @@ void quickjs_repl_run(quickjs_ctx_t *state) {
       /* Run pending promise microtasks */
       quickjs_run_jobs_helper(state);
 
-      /* Print result if not undefined */
+      /* Print result and cache to global `_` */
       if (!JS_IsUndefined(val)) {
+        JSValue global = JS_GetGlobalObject(qctx);
+        JS_SetPropertyStr(qctx, global, "_", JS_DupValue(qctx, val));
+        JS_FreeValue(qctx, global);
+
         if (JS_IsPromise(val)) {
           JSValue res = JS_PromiseResult(qctx, val);
           int pstate = JS_PromiseState(qctx, val);
@@ -284,6 +321,22 @@ void quickjs_repl_run(quickjs_ctx_t *state) {
             mp_printf(&mp_plat_print, "Promise { <pending> }\n");
           }
           JS_FreeValue(qctx, res);
+        } else if (hex_mode && JS_IsNumber(val)) {
+          int64_t ival = 0;
+          if (JS_ToInt64(qctx, &ival, val) == 0) {
+            if (ival < 0) {
+              mp_printf(&mp_plat_print, "-0x%llx\n",
+                        (unsigned long long)(-ival));
+            } else {
+              mp_printf(&mp_plat_print, "0x%llx\n", (unsigned long long)ival);
+            }
+          } else {
+            const char *val_str = JS_ToCString(qctx, val);
+            if (val_str != NULL) {
+              mp_printf(&mp_plat_print, "%s\n", val_str);
+              JS_FreeCString(qctx, val_str);
+            }
+          }
         } else {
           const char *val_str = JS_ToCString(qctx, val);
           if (val_str != NULL) {

@@ -13,6 +13,8 @@ test_modules = [
     "test_module",
     "test_console",
     "test_web",
+    "test_tooling",
+    "test_sys_web",
     "test_asyncio",
     "test_lifecycle",
 ]

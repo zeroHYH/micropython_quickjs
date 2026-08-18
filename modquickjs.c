@@ -48,6 +48,7 @@ static mp_obj_t mod_quickjs_init(void) {
 
   quickjs_init_console(ctx);
   quickjs_init_web_apis(ctx);
+  quickjs_init_std_modules(ctx);
 
   return mp_const_none;
 }
@@ -335,6 +336,39 @@ mp_obj_t mod_quickjs_eval_json(mp_obj_t json_str_obj) {
 static MP_DEFINE_CONST_FUN_OBJ_1(mod_quickjs_eval_json_obj,
                                  mod_quickjs_eval_json);
 
+mp_obj_t mod_quickjs_memory_stats(void) {
+  if (rt == NULL) {
+    mod_quickjs_init();
+  }
+  return quickjs_memory_stats_helper(rt);
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_0(mod_quickjs_memory_stats_obj,
+                                 mod_quickjs_memory_stats);
+
+mp_obj_t mod_quickjs_bjson_encode(mp_obj_t obj) {
+  if (rt == NULL) {
+    mod_quickjs_init();
+  }
+  return quickjs_bjson_encode_helper(NULL, obj);
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_1(mod_quickjs_bjson_encode_obj,
+                                 mod_quickjs_bjson_encode);
+
+mp_obj_t mod_quickjs_bjson_decode(mp_obj_t bytes_obj) {
+  if (rt == NULL) {
+    mod_quickjs_init();
+  }
+  mp_buffer_info_t bufinfo;
+  mp_get_buffer_raise(bytes_obj, &bufinfo, MP_BUFFER_READ);
+  return quickjs_bjson_decode_helper(NULL, (const uint8_t *)bufinfo.buf,
+                                     bufinfo.len);
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_1(mod_quickjs_bjson_decode_obj,
+                                 mod_quickjs_bjson_decode);
+
 static const mp_rom_map_elem_t quickjs_module_globals_table[] = {
 
     {MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_quickjs)},
@@ -346,6 +380,15 @@ static const mp_rom_map_elem_t quickjs_module_globals_table[] = {
     {MP_ROM_QSTR(MP_QSTR_eval), MP_ROM_PTR(&mod_quickjs_eval_obj)},
 
     {MP_ROM_QSTR(MP_QSTR_eval_json), MP_ROM_PTR(&mod_quickjs_eval_json_obj)},
+
+    {MP_ROM_QSTR(MP_QSTR_bjson_encode),
+     MP_ROM_PTR(&mod_quickjs_bjson_encode_obj)},
+
+    {MP_ROM_QSTR(MP_QSTR_bjson_decode),
+     MP_ROM_PTR(&mod_quickjs_bjson_decode_obj)},
+
+    {MP_ROM_QSTR(MP_QSTR_memory_stats),
+     MP_ROM_PTR(&mod_quickjs_memory_stats_obj)},
 
     {MP_ROM_QSTR(MP_QSTR_call), MP_ROM_PTR(&mod_quickjs_call_obj)},
 

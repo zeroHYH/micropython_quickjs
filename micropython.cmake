@@ -30,6 +30,7 @@ target_sources(usermod_quickjs INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/qjs_repl.c
     ${CMAKE_CURRENT_LIST_DIR}/qjs_console.c
     ${CMAKE_CURRENT_LIST_DIR}/qjs_web.c
+    ${CMAKE_CURRENT_LIST_DIR}/qjs_std.c
     ${CMAKE_CURRENT_LIST_DIR}/src/quickjs.c
     ${CMAKE_CURRENT_LIST_DIR}/src/libregexp.c
     ${CMAKE_CURRENT_LIST_DIR}/src/libunicode.c
