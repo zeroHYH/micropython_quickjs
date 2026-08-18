@@ -642,8 +642,47 @@ globalThis.calc = mul(6, 7);
 """)
 assert ctx.get("calc") == 42
 
-# 3. VFS File Loading (loads ./utils.js from filesystem)
-# import { helper } from './utils.js';
+### Built-in `console` Object
+
+A standard `console` object is built-in and automatically available in every JavaScript context (including the REPL):
+
+```javascript
+console.log("Sensor data:", 100, { temp: 25.4 });
+console.info("System ready");
+console.warn("Low memory warning");     // Output prefixed with [WARN]
+console.error("Connection failed");     // Output prefixed with [ERROR]
+```
+
+### Async / `uasyncio` Event Loop Integration
+
+JavaScript Promises can be awaited non-blockingly inside MicroPython `uasyncio` tasks:
+
+```python
+import asyncio
+import quickjs
+
+ctx = quickjs.Context()
+
+
+async def async_wait(promise, ctx=None, poll_ms=1):
+    while not promise.done():
+        if ctx is not None:
+            ctx.run_jobs()
+        else:
+            quickjs.run_jobs()
+        if promise.done():
+            break
+        await asyncio.sleep_ms(poll_ms)
+    return promise.result()
+
+
+async def main():
+    p = ctx.eval("Promise.resolve({ status: 'connected' })")
+    data = await async_wait(p, ctx)
+    print("Async result:", data)
+
+
+asyncio.run(main())
 ```
 
 ### Interactive C-level REPL
@@ -666,7 +705,15 @@ ctx.repl()
   - Native line editing, history, and arrow key support via MicroPython's `readline`.
   - Multiline statement detection: unclosed `{`, `(`, `[`, template literals, and strings automatically prompt with `... `.
   - Async Promise evaluation: automatically runs microtask jobs (`run_jobs()`) and formats `Promise { <fulfilled>: ... }`.
-  - Dot commands: `.help`, `.clear`, `.mem` (view JS heap bytes), `.gc`, `.exit` (or press `Ctrl+D`).
+  - Dot commands:
+    - `.help` : Show REPL commands
+    - `.load <file.js>` : Load and evaluate an external script file
+    - `.time <code...>` : Benchmark execution time in microseconds
+    - `.version`: Print engine version
+    - `.mem`  : View JS heap memory usage
+    - `.gc`   : Run JavaScript garbage collection
+    - `.clear`: Reset context state
+    - `.exit` / `.quit` (or press `Ctrl+D`): Return to MicroPython
 
 ## Tests
 
@@ -683,6 +730,8 @@ micropython tests/test_function.py     # function wrappers, callbacks, reentranc
 micropython tests/test_promise.py      # promises, async/await, unhandled rejection tracker
 micropython tests/test_bytecode.py     # bytecode compilation, execution, cross-context sharing
 micropython tests/test_module.py       # ES module evaluation, Python loader, VFS import
+micropython tests/test_console.py      # built-in console logging and formatting
+micropython tests/test_asyncio.py      # asyncio event loop cooperative promise waiting
 micropython tests/test_lifecycle.py    # lifecycle, multiple contexts, OOM & stress
 ```
 
@@ -698,17 +747,19 @@ qjs_context.c         quickjs.Context() instance management & methods
 qjs_exec.c            execution engine, bytecode helpers, timeout interrupt & job queue
 qjs_module.c          ES module evaluation, VFS bridge & custom Python loader callback
 qjs_repl.c            built-in interactive C REPL via shared/readline
+qjs_console.c         built-in console object (log, warn, error, info, debug)
 qjs_convert.c         bidirectional JS <-> MicroPython type conversion
 qjs_error.c           unified error handling & exception formatting
 qjs_callback.c        Python callable -> JS CClosure callback registry
 qjs_promise.c         Promise wrapper, then/catch/finally_ chaining & resolver
 qjs_func.c            Function wrapper, call/this binding & pass-through
 qjs_bigint.c          arbitrary precision BigInt marker & conversions
-tests/                functional test suites (test_basic, test_convert, test_function, test_promise, test_bytecode, test_module, test_lifecycle, run_all.py)
+tests/                functional test suites (test_basic, test_convert, test_function, test_promise, test_bytecode, test_module, test_console, test_asyncio, test_lifecycle, run_all.py)
 src/                  generated: QuickJS-NG fetched from GitHub (git-ignored)
 ```
 
 ## License
 
 MIT (QuickJS-NG is MIT).
+
 

@@ -11,6 +11,8 @@ test_modules = [
     "test_promise",
     "test_bytecode",
     "test_module",
+    "test_console",
+    "test_asyncio",
     "test_lifecycle",
 ]
 

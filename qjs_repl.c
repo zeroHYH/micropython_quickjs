@@ -1,4 +1,5 @@
 #include "modquickjs.h"
+#include "py/reader.h"
 #include "shared/readline/readline.h"
 
 /* -------------------------------------------------------------------------- */
@@ -54,12 +55,115 @@ void quickjs_repl_run(quickjs_ctx_t *state) {
         vstr_clear(&input_buf);
         break;
       } else if (strcmp(line_str, ".help") == 0) {
-        mp_printf(&mp_plat_print, "REPL Commands:\n"
-                                  "  .help   Show this help message\n"
-                                  "  .clear  Clear context state\n"
-                                  "  .mem    Print QuickJS heap usage\n"
-                                  "  .gc     Run JavaScript garbage collector\n"
-                                  "  .exit   Exit REPL\n");
+        mp_printf(&mp_plat_print,
+                  "REPL Commands:\n"
+                  "  .help         Show this help message\n"
+                  "  .load <file>  Load and evaluate a JavaScript file\n"
+                  "  .time <code...> Benchmark execution time of JavaScript "
+                  "code\n"
+                  "  .mem          Print QuickJS heap usage\n"
+                  "  .gc           Run JavaScript garbage collector\n"
+                  "  .clear        Clear context state\n"
+                  "  .version      Show engine version\n"
+                  "  .exit         Exit REPL\n");
+      } else if (strcmp(line_str, ".version") == 0) {
+        mp_printf(&mp_plat_print, "QuickJS-NG version: %s\n", JS_GetVersion());
+      } else if (strncmp(line_str, ".load ", 6) == 0) {
+        const char *filename = line_str + 6;
+        while (*filename == ' ') {
+          filename++;
+        }
+        if (*filename == '\0') {
+          mp_printf(&mp_plat_print, "Usage: .load <filename.js>\n");
+        } else {
+          mp_reader_t reader;
+          nlr_buf_t nlr_file;
+          if (nlr_push(&nlr_file) == 0) {
+            qstr q_name = qstr_from_str(filename);
+            mp_reader_new_file(&reader, q_name);
+            nlr_pop();
+
+            vstr_t fbuf;
+            vstr_init(&fbuf, 256);
+            while (reader.readbyte != NULL) {
+              int c = reader.readbyte(reader.data);
+              if (c < 0) {
+                break;
+              }
+              vstr_add_byte(&fbuf, c);
+            }
+            reader.close(reader.data);
+
+            JSContext *qctx = state->ctx;
+            quickjs_ctx_enter(state);
+            quickjs_ctx_arm_timeout(state);
+
+            JSValue val = JS_Eval(qctx, vstr_str(&fbuf), vstr_len(&fbuf),
+                                  filename, JS_EVAL_TYPE_GLOBAL);
+            (void)quickjs_ctx_finish_timeout(state);
+            quickjs_ctx_leave(state);
+            vstr_clear(&fbuf);
+
+            if (JS_IsException(val)) {
+              JSValue exc = JS_GetException(qctx);
+              const char *exc_str = JS_ToCString(qctx, exc);
+              mp_printf(&mp_plat_print, "Error in '%s': %s\n", filename,
+                        (exc_str != NULL) ? exc_str : "exception");
+              if (exc_str != NULL) {
+                JS_FreeCString(qctx, exc_str);
+              }
+              JS_FreeValue(qctx, exc);
+            } else {
+              quickjs_run_jobs_helper(state);
+              mp_printf(&mp_plat_print, "Loaded and executed '%s'\n", filename);
+              JS_FreeValue(qctx, val);
+            }
+          } else {
+            mp_printf(&mp_plat_print, "Failed to open file '%s'\n", filename);
+          }
+        }
+      } else if (strncmp(line_str, ".time ", 6) == 0) {
+        const char *code = line_str + 6;
+        while (*code == ' ') {
+          code++;
+        }
+        if (*code != '\0') {
+          JSContext *qctx = state->ctx;
+          quickjs_ctx_enter(state);
+          quickjs_ctx_arm_timeout(state);
+
+          mp_uint_t t_start = mp_hal_ticks_us();
+          JSValue val =
+              JS_Eval(qctx, code, strlen(code), "<time>", JS_EVAL_TYPE_GLOBAL);
+          mp_uint_t t_elapsed_us = mp_hal_ticks_us() - t_start;
+
+          (void)quickjs_ctx_finish_timeout(state);
+          quickjs_ctx_leave(state);
+
+          if (JS_IsException(val)) {
+            JSValue exc = JS_GetException(qctx);
+            const char *exc_str = JS_ToCString(qctx, exc);
+            mp_printf(&mp_plat_print, "Uncaught %s\n",
+                      (exc_str != NULL) ? exc_str : "error");
+            if (exc_str != NULL) {
+              JS_FreeCString(qctx, exc_str);
+            }
+            JS_FreeValue(qctx, exc);
+          } else {
+            quickjs_run_jobs_helper(state);
+            const char *val_str = JS_ToCString(qctx, val);
+            mp_printf(&mp_plat_print, "Result: %s\n",
+                      (val_str != NULL) ? val_str : "undefined");
+            if (val_str != NULL) {
+              JS_FreeCString(qctx, val_str);
+            }
+            JS_FreeValue(qctx, val);
+          }
+          mp_printf(&mp_plat_print, "Execution time: %lu.%03lu ms (%lu us)\n",
+                    (unsigned long)(t_elapsed_us / 1000),
+                    (unsigned long)(t_elapsed_us % 1000),
+                    (unsigned long)t_elapsed_us);
+        }
       } else if (strcmp(line_str, ".mem") == 0) {
         if (state->rt != NULL) {
           JSMemoryUsage stats;

@@ -56,6 +56,8 @@ mp_obj_t quickjs_context_make_new(const mp_obj_type_t *type, size_t n_args,
     JS_SetInterruptHandler(qrt, quickjs_interrupt_handler, state);
     JS_SetModuleLoaderFunc(qrt, NULL, quickjs_module_loader_cb, state);
 
+    quickjs_init_console(qctx);
+
     self = MP_OBJ_FROM_PTR(obj);
 
     nlr_pop();

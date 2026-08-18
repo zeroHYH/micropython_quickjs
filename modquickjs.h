@@ -204,6 +204,9 @@ void quickjs_raise_exception_state(JSContext *qctx, JSValue val,
                                    bool timed_out);
 JSValue quickjs_exception_to_js_error(JSContext *qctx, mp_obj_t exc);
 
+/* qjs_console.c */
+void quickjs_init_console(JSContext *ctx);
+
 /* qjs_exec.c */
 void quickjs_ctx_enter(quickjs_ctx_t *state);
 void quickjs_ctx_leave(quickjs_ctx_t *state);

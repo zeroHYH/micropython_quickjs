@@ -46,6 +46,8 @@ static mp_obj_t mod_quickjs_init(void) {
                  MP_ERROR_TEXT("failed to create JS Context"));
   }
 
+  quickjs_init_console(ctx);
+
   return mp_const_none;
 }
 
