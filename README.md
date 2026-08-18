@@ -42,7 +42,7 @@ QJS_REF=v0.16.1 ./get_quickjs.sh
 ```
 
 > The default QuickJS heap limit is 128 KiB (`QUICKJS_DEFAULT_MEMORY_LIMIT` in
-> `modquickjs.c`, no longer overridden at build time). On a 64-bit host
+> `modquickjs.h`, no longer overridden at build time). On a 64-bit host
 > QuickJS-NG needs more than 64 KiB just to create a JSContext, so Make-based
 > builds of this module have always needed a host-side override; the default
 > was raised to 128 KiB because that is the verified *device* budget needed
@@ -65,13 +65,13 @@ QJS_REF=v0.16.1 ./get_quickjs.sh
 ```python
 import quickjs
 
-quickjs.init()            # idempotent
-quickjs.eval("1 + 2")     # -> 3
+quickjs.init()  # idempotent
+quickjs.eval("1 + 2")  # -> 3
 quickjs.call("add", 1, 2)
-quickjs.run_jobs()        # execute pending JS jobs (promise microtasks)
+quickjs.run_jobs()  # execute pending JS jobs (promise microtasks)
 quickjs.has_pending_jobs()  # -> bool
-quickjs.bigint(10**30)    # explicit BigInt marker (see BigInt below)
-quickjs.version()         # -> "0.16.1"
+quickjs.bigint(10**30)  # explicit BigInt marker (see BigInt below)
+quickjs.version()  # -> "0.16.1"
 quickjs.help()
 ```
 
@@ -83,24 +83,24 @@ job queue still work normally.
 ### Context (isolated runtime)
 
 ```python
-ctx = quickjs.Context()        # independent JSRuntime + JSContext
+ctx = quickjs.Context()  # independent JSRuntime + JSContext
 
 ctx.eval("function add(a,b){ return a+b; }")
-ctx.call("add", 10, 20)        # -> 30
-ctx.get("answer")              # None if missing
-ctx.set("config", {"name": "MicroPython", "items": [1,2,3]})
+ctx.call("add", 10, 20)  # -> 30
+ctx.get("answer")  # None if missing
+ctx.set("config", {"name": "MicroPython", "items": [1, 2, 3]})
 
-ctx.gc()                       # run the JS garbage collector
-ctx.run_jobs()                 # execute pending JS jobs; returns count
-ctx.has_pending_jobs()         # -> bool
-ctx.set_memory_limit(128*1024) # JS heap limit, 0 = unlimited
-ctx.set_max_stack_size(256*1024) # JS stack limit, 0 = unlimited (default 1 MiB)
-ctx._js_mem()                  # debug: JS heap usage in bytes
+ctx.gc()  # run the JS garbage collector
+ctx.run_jobs()  # execute pending JS jobs; returns count
+ctx.has_pending_jobs()  # -> bool
+ctx.set_memory_limit(128 * 1024)  # JS heap limit, 0 = unlimited
+ctx.set_max_stack_size(256 * 1024)  # JS stack limit, 0 = unlimited (default 1 MiB)
+ctx._js_mem()  # debug: JS heap usage in bytes
 
-ctx.close()                    # free runtime; idempotent
+ctx.close()  # free runtime; idempotent
 
 # Phase 7: create a promise from Python
-p, resolve, reject = ctx.promise()   # -> (Promise wrapper, resolve, reject)
+p, resolve, reject = ctx.promise()  # -> (Promise wrapper, resolve, reject)
 ```
 
 Each `Context` owns an independent runtime, so global state is fully
@@ -124,7 +124,7 @@ counter is restored on *every* path (return, exception, timeout, job error).
 
 ```python
 ctx.eval("function add(a,b){ return a+b; }")
-add = ctx.get("add")           # JS function -> Python callable wrapper
+add = ctx.get("add")  # JS function -> Python callable wrapper
 assert callable(add)
 assert add(1, 2) == 3
 ```
@@ -136,12 +136,14 @@ Keyword arguments are rejected with `TypeError`.
 ### `this` binding (`wrapper.call`)
 
 ```python
-ctx.eval("globalThis.obj = { value: 42, getValue: function(x){ return this.value + x; } };")
+ctx.eval(
+    "globalThis.obj = { value: 42, getValue: function(x){ return this.value + x; } };"
+)
 getValue = ctx.eval("obj.getValue")
 obj = ctx.get("obj")
 
-getValue.call(obj, 8)          # -> 50   (this = obj)
-getValue(8)                    # -> NaN  (default: this is undefined -> sloppy-mode global)
+getValue.call(obj, 8)  # -> 50   (this = obj)
+getValue(8)  # -> NaN  (default: this is undefined -> sloppy-mode global)
 ```
 
 - `wrapper.call(this_obj, *args)` binds `this` to the converted
@@ -154,7 +156,9 @@ getValue(8)                    # -> NaN  (default: this is undefined -> sloppy-m
 ```python
 def multiply(a, b):
     return a * b
-ctx.add_callable("multiply", multiply)   # Python callable -> JS function
+
+
+ctx.add_callable("multiply", multiply)  # Python callable -> JS function
 assert ctx.eval("multiply(6, 7)") == 42
 ```
 
@@ -167,11 +171,13 @@ and re-thrown as a JS error, then mapped back to MicroPython:
 ```python
 def fail():
     raise ValueError("callback failure")
+
+
 ctx.add_callable("fail", fail)
 try:
     ctx.eval("fail()")
 except Exception as e:
-    print(e)   # TypeError: ValueError: callback failure
+    print(e)  # TypeError: ValueError: callback failure
 ```
 
 JS code can also `try/catch` the error. Registering the same name twice
@@ -180,15 +186,15 @@ replaces the previous callable.
 ### Execution timeout
 
 ```python
-ctx.set_time_limit(100)          # ms; 0 disables; negative -> ValueError
+ctx.set_time_limit(100)  # ms; 0 disables; negative -> ValueError
 
 try:
     ctx.eval("while (true) {}")
 except RuntimeError as e:
-    print(e)                     # JavaScript execution timeout
+    print(e)  # JavaScript execution timeout
 
 ctx.set_time_limit(0)
-assert ctx.eval("1 + 2") == 3   # context is reusable after a timeout
+assert ctx.eval("1 + 2") == 3  # context is reusable after a timeout
 ```
 
 The timeout covers `eval`, `call`, `run_jobs`, promise methods and
@@ -231,8 +237,8 @@ reference to the Context, so it never dangles):
 
 ```python
 p = ctx.eval("Promise.resolve(42)")
-p.done()                 # -> bool: settled (fulfilled or rejected)?
-p.result()               # -> 42  (raises the rejection, or RuntimeError if pending)
+p.done()  # -> bool: settled (fulfilled or rejected)?
+p.result()  # -> 42  (raises the rejection, or RuntimeError if pending)
 ```
 - `p.result()` on a fulfilled promise converts the value as usual
   (object/array/bytes/etc.).
@@ -245,8 +251,8 @@ p.result()               # -> 42  (raises the rejection, or RuntimeError if pend
 
 ```python
 p = ctx.eval("Promise.resolve(1).then(() => { throw new Error('failure'); })")
-ctx.run_jobs()           # the reaction job runs; the derived promise is rejected
-p.result()               # raises RuntimeError: Error: failure
+ctx.run_jobs()  # the reaction job runs; the derived promise is rejected
+p.result()  # raises RuntimeError: Error: failure
 ```
 
 Notes:
@@ -266,16 +272,16 @@ attach reaction callbacks to a JS promise and chain further promises on the
 Python side:
 
 ```python
-q = p.then(on_fulfilled=None, on_rejected=None)   # -> new Promise wrapper
-q = p.catch(on_rejected=None)                      # -> p.then(None, r)
-q = p.finally_(callback=None)                      # -> new Promise wrapper
+q = p.then(on_fulfilled=None, on_rejected=None)  # -> new Promise wrapper
+q = p.catch(on_rejected=None)  # -> p.then(None, r)
+q = p.finally_(callback=None)  # -> new Promise wrapper
 ```
 
 ```python
 p = ctx.eval("Promise.resolve(10)")
-q = p.then(lambda x: x * 2)          # Python callback runs in a microtask
-ctx.run_jobs()                        # execute the reaction job
-q.result()                            # -> 20
+q = p.then(lambda x: x * 2)  # Python callback runs in a microtask
+ctx.run_jobs()  # execute the reaction job
+q.result()  # -> 20
 ```
 
 Semantics (implemented on the native QuickJS `JS_PromiseThen` and the
@@ -308,8 +314,8 @@ native `Promise.prototype.finally`):
 the three-tuple `(p, resolve, reject)`:
 
 ```python
-p, resolve, reject = ctx.promise()   # p: Promise wrapper (same as eval's)
-resolve(42)                          # settle fulfilled
+p, resolve, reject = ctx.promise()  # p: Promise wrapper (same as eval's)
+resolve(42)  # settle fulfilled
 # reject(ValueError("failed"))       # settle rejected (see below)
 assert p.result() == 42
 ```
@@ -363,7 +369,7 @@ on top of the existing `run_jobs()` / wrappers / callback registry /
 
 ```python
 ctx.eval("async function foo() { return 42; }")
-p = ctx.get("foo")()       # p is the ordinary Promise wrapper
+p = ctx.get("foo")()  # p is the ordinary Promise wrapper
 ctx.run_jobs()
 assert p.result() == 42
 ```
@@ -417,9 +423,9 @@ QuickJS `JS_SetHostPromiseRejectionTracker()` (runtime level, one tracker
 per Context) to a Python callback:
 
 ```python
-ctx.set_unhandled_rejection_handler(handler)   # handler(reason, is_handled)
-ctx.eval("Promise.reject('boom')")             # handler called with ("boom", False)
-ctx.run_jobs()                                  # diagnostic: never raises
+ctx.set_unhandled_rejection_handler(handler)  # handler(reason, is_handled)
+ctx.eval("Promise.reject('boom')")  # handler called with ("boom", False)
+ctx.run_jobs()  # diagnostic: never raises
 ```
 
 Guaranteed semantics (pinned by the Phase 9 tests, verified against the
@@ -467,11 +473,14 @@ A JS function wrapper obtained from one Context can be handed back into the
 ```python
 ctx.eval("function mul(a, b){ return a * b; }")
 mul = ctx.get("mul")
-ctx.set("mul2", mul)           # pass-through: same context
+ctx.set("mul2", mul)  # pass-through: same context
 assert ctx.eval("mul2(6, 7)") == 42
 
+
 def pick():
-    return mul                 # callback returning a JS function wrapper
+    return mul  # callback returning a JS function wrapper
+
+
 ctx.add_callable("pick", pick)
 assert ctx.eval("pick()(3, 4)") == 12
 ```
@@ -523,9 +532,9 @@ Python `int` -> JS stays a `number` (int32/float64, unchanged). For an
 explicit JS `BigInt`, use `quickjs.bigint(value)`:
 
 ```python
-ctx.set("x", quickjs.bigint(123456789012345678901234567890))   # arbitrary precision
-ctx.eval("x.toString()")    # -> "123456789012345678901234567890"
-ctx.set("y", quickjs.bigint(-42))                              # negative / 0 / small OK
+ctx.set("x", quickjs.bigint(123456789012345678901234567890))  # arbitrary precision
+ctx.eval("x.toString()")  # -> "123456789012345678901234567890"
+ctx.set("y", quickjs.bigint(-42))  # negative / 0 / small OK
 ```
 
 - Values within int64 range use the official `JS_NewBigInt64` C API; values
@@ -588,35 +597,16 @@ stack:
 Run with the built unix `micropython` binary:
 
 ```sh
-micropython tests/test_quickjs_phase0.py   # baseline conversions + API
-micropython tests/test_quickjs_phase1.py   # Context lifecycle / GC
-micropython tests/test_quickjs_phase2.py   # depth/cycles, binary, BigInt, errors
-micropython tests/test_quickjs_phase3.py   # function bridge + timeout
-micropython tests/test_quickjs_phase4.py   # promise/job queue + pass-through + lifecycle
-micropython tests/test_quickjs_phase5.py   # reentrancy, promise bridging, this, TypedArray, bigint, GC/lifetime
-micropython tests/test_quickjs_phase6.py   # execution safety: nested timeout budget, conversion ownership, contamination
-micropython tests/test_quickjs_phase7.py   # python-side promise creation/control (ctx.promise)
-micropython tests/test_quickjs_phase8.py   # async/await execution model (native, no engine changes)
-micropython tests/test_quickjs_phase9.py   # unhandled rejection diagnostics (set_unhandled_rejection_handler)
-micropython tests/test_quickjs_phase10.py  # final ownership/lifecycle audit + stress (GC-order attacks, close-busy
-                                           # contract, timeout/OOM combos, 10000x stress; regressions for the
-                                           # OOM-path fixes: promise resolve funcs init, JSPropertyEnum props
-                                           # leak, JS_FreeCString on MP OOM, handler-closure node reaping)
+# Run the complete test suite:
+micropython tests/run_all.py
+
+# Or run individual functional test modules:
+micropython tests/test_basic.py        # module singleton & Context basics, timeouts
+micropython tests/test_convert.py      # type conversions, BigInt, TypedArray, safety
+micropython tests/test_function.py     # function wrappers, callbacks, reentrancy
+micropython tests/test_promise.py      # promises, async/await, unhandled rejection tracker
+micropython tests/test_lifecycle.py    # lifecycle, multiple contexts, OOM & stress
 ```
-
-Phase 10 notes:
-
-- The JS heap of each context has a hard cap: `QUICKJS_DEFAULT_MEMORY_LIMIT`
-  (default 128 KiB for MCU parity; the Make-style Unix port overrides it to
-  8 MiB via `-DQUICKJS_DEFAULT_MEMORY_LIMIT=8388608`).  Exhausting the cap is
-  intended device protection; the engine's OOM fallback then throws a JS
-  `null` value (see `JS_ThrowError2` in the vendored QuickJS), which the
-  module surfaces as `RuntimeError('null')` instead of a descriptive
-  "out of memory" — an engine-side ambiguity between "heap limit hit" and
-  `throw null`, documented as a known limitation.
-- LSan baselines (open-context-at-exit user behaviour, unchanged):
-  phase1 ≈ 107 KB, phase3 ≈ 103 KB, phase4 ≈ 816 KB (from leaked contexts
-  those suites intentionally leave open).
 
 ## Layout
 
@@ -624,8 +614,17 @@ Phase 10 notes:
 micropython.cmake     CMake-based ports (esp32, rp2) — auto-fetches QuickJS
 micropython.mk        Make-based ports (unix, stm32, ...) — auto-fetches QuickJS
 get_quickjs.sh        fetch the QuickJS-NG engine into src/ (from GitHub)
-modquickjs.c          the module implementation
-tests/                Python test suites
+modquickjs.h          unified header: structs, macros, cross-module prototypes
+modquickjs.c          module registration & singleton API entry points
+qjs_context.c         quickjs.Context() instance management & methods
+qjs_exec.c            execution engine, timeout interrupt & job queue helper
+qjs_convert.c         bidirectional JS <-> MicroPython type conversion
+qjs_error.c           unified error handling & exception formatting
+qjs_callback.c        Python callable -> JS CClosure callback registry
+qjs_promise.c         Promise wrapper, then/catch/finally_ chaining & resolver
+qjs_func.c            Function wrapper, call/this binding & pass-through
+qjs_bigint.c          arbitrary precision BigInt marker & conversions
+tests/                functional test suites (test_basic, test_convert, test_function, test_promise, test_lifecycle, run_all.py)
 src/                  generated: QuickJS-NG fetched from GitHub (git-ignored)
 ```
 

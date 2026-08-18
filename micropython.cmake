@@ -18,6 +18,14 @@ endif()
 
 target_sources(usermod_quickjs INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/modquickjs.c
+    ${CMAKE_CURRENT_LIST_DIR}/qjs_error.c
+    ${CMAKE_CURRENT_LIST_DIR}/qjs_convert.c
+    ${CMAKE_CURRENT_LIST_DIR}/qjs_exec.c
+    ${CMAKE_CURRENT_LIST_DIR}/qjs_callback.c
+    ${CMAKE_CURRENT_LIST_DIR}/qjs_func.c
+    ${CMAKE_CURRENT_LIST_DIR}/qjs_promise.c
+    ${CMAKE_CURRENT_LIST_DIR}/qjs_bigint.c
+    ${CMAKE_CURRENT_LIST_DIR}/qjs_context.c
     ${CMAKE_CURRENT_LIST_DIR}/src/quickjs.c
     ${CMAKE_CURRENT_LIST_DIR}/src/libregexp.c
     ${CMAKE_CURRENT_LIST_DIR}/src/libunicode.c
