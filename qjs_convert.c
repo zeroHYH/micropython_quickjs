@@ -385,6 +385,155 @@ mp_obj_t quickjs_typedarray_to_mp(JSContext *ctx, JSValueConst val) {
   return mp_const_none; /* unreachable */
 }
 
+mp_obj_t quickjs_map_to_mp(JSContext *ctx, JSValueConst val,
+                           quickjs_convert_state_t *st) {
+  JSValue entries_fn = JS_GetPropertyStr(ctx, val, "entries");
+  if (JS_IsException(entries_fn) || !JS_IsFunction(ctx, entries_fn)) {
+    JS_FreeValue(ctx, entries_fn);
+    quickjs_clear_pending_exception(ctx);
+    return mp_obj_new_dict(0);
+  }
+
+  JSValue iter = JS_Call(ctx, entries_fn, val, 0, NULL);
+  JS_FreeValue(ctx, entries_fn);
+  if (JS_IsException(iter)) {
+    quickjs_clear_pending_exception(ctx);
+    return mp_obj_new_dict(0);
+  }
+
+  JSValue next_fn = JS_GetPropertyStr(ctx, iter, "next");
+  if (JS_IsException(next_fn) || !JS_IsFunction(ctx, next_fn)) {
+    JS_FreeValue(ctx, next_fn);
+    JS_FreeValue(ctx, iter);
+    quickjs_clear_pending_exception(ctx);
+    return mp_obj_new_dict(0);
+  }
+
+  mp_obj_t result = mp_obj_new_dict(0);
+  bool pushed = false;
+  nlr_buf_t nlr;
+
+  if (nlr_push(&nlr) == 0) {
+    quickjs_convert_push_mp(st, JS_VALUE_GET_PTR(val));
+    pushed = true;
+
+    for (;;) {
+      JSValue step = JS_Call(ctx, next_fn, iter, 0, NULL);
+      if (JS_IsException(step)) {
+        quickjs_clear_pending_exception(ctx);
+        break;
+      }
+      JSValue done_val = JS_GetPropertyStr(ctx, step, "done");
+      bool done = JS_ToBool(ctx, done_val);
+      JS_FreeValue(ctx, done_val);
+      if (done) {
+        JS_FreeValue(ctx, step);
+        break;
+      }
+      JSValue entry = JS_GetPropertyStr(ctx, step, "value");
+      JS_FreeValue(ctx, step);
+
+      if (!JS_IsException(entry)) {
+        JSValue k = JS_GetPropertyUint32(ctx, entry, 0);
+        JSValue v = JS_GetPropertyUint32(ctx, entry, 1);
+        mp_obj_t mp_k = quickjs_to_mp_obj(ctx, k, st);
+        mp_obj_t mp_v = quickjs_to_mp_obj(ctx, v, st);
+        mp_obj_dict_store(result, mp_k, mp_v);
+        JS_FreeValue(ctx, k);
+        JS_FreeValue(ctx, v);
+        JS_FreeValue(ctx, entry);
+      }
+    }
+    nlr_pop();
+  } else {
+    if (pushed) {
+      quickjs_convert_pop(st);
+    }
+    JS_FreeValue(ctx, next_fn);
+    JS_FreeValue(ctx, iter);
+    nlr_raise(nlr.ret_val);
+  }
+
+  if (pushed) {
+    quickjs_convert_pop(st);
+  }
+  JS_FreeValue(ctx, next_fn);
+  JS_FreeValue(ctx, iter);
+  return result;
+}
+
+mp_obj_t quickjs_set_to_mp(JSContext *ctx, JSValueConst val,
+                           quickjs_convert_state_t *st) {
+  JSValue values_fn = JS_GetPropertyStr(ctx, val, "values");
+  if (JS_IsException(values_fn) || !JS_IsFunction(ctx, values_fn)) {
+    JS_FreeValue(ctx, values_fn);
+    quickjs_clear_pending_exception(ctx);
+    return mp_obj_new_set(0, NULL);
+  }
+
+  JSValue iter = JS_Call(ctx, values_fn, val, 0, NULL);
+  JS_FreeValue(ctx, values_fn);
+  if (JS_IsException(iter)) {
+    quickjs_clear_pending_exception(ctx);
+    return mp_obj_new_set(0, NULL);
+  }
+
+  JSValue next_fn = JS_GetPropertyStr(ctx, iter, "next");
+  if (JS_IsException(next_fn) || !JS_IsFunction(ctx, next_fn)) {
+    JS_FreeValue(ctx, next_fn);
+    JS_FreeValue(ctx, iter);
+    quickjs_clear_pending_exception(ctx);
+    return mp_obj_new_set(0, NULL);
+  }
+
+  mp_obj_t result = mp_obj_new_set(0, NULL);
+  bool pushed = false;
+  nlr_buf_t nlr;
+
+  if (nlr_push(&nlr) == 0) {
+    quickjs_convert_push_mp(st, JS_VALUE_GET_PTR(val));
+    pushed = true;
+
+    for (;;) {
+      JSValue step = JS_Call(ctx, next_fn, iter, 0, NULL);
+      if (JS_IsException(step)) {
+        quickjs_clear_pending_exception(ctx);
+        break;
+      }
+      JSValue done_val = JS_GetPropertyStr(ctx, step, "done");
+      bool done = JS_ToBool(ctx, done_val);
+      JS_FreeValue(ctx, done_val);
+      if (done) {
+        JS_FreeValue(ctx, step);
+        break;
+      }
+      JSValue item = JS_GetPropertyStr(ctx, step, "value");
+      JS_FreeValue(ctx, step);
+
+      if (!JS_IsException(item)) {
+        mp_obj_t mp_item = quickjs_to_mp_obj(ctx, item, st);
+        mp_obj_set_store(result, mp_item);
+        JS_FreeValue(ctx, item);
+      }
+    }
+    nlr_pop();
+  } else {
+    if (pushed) {
+      quickjs_convert_pop(st);
+    }
+    JS_FreeValue(ctx, next_fn);
+    JS_FreeValue(ctx, iter);
+    nlr_raise(nlr.ret_val);
+  }
+
+  if (pushed) {
+    quickjs_convert_pop(st);
+  }
+  JS_FreeValue(ctx, next_fn);
+  JS_FreeValue(ctx, iter);
+  return result;
+}
+
 mp_obj_t quickjs_to_mp_obj(JSContext *ctx, JSValueConst val,
                            quickjs_convert_state_t *st) {
   int tag = JS_VALUE_GET_TAG(val);
@@ -398,48 +547,96 @@ mp_obj_t quickjs_to_mp_obj(JSContext *ctx, JSValueConst val,
     return mp_const_none;
 
   case JS_TAG_BOOL: {
-
     int b = JS_ToBool(ctx, val);
-
     return mp_obj_new_bool(b);
   }
 
   case JS_TAG_INT: {
-
     int32_t value = JS_VALUE_GET_INT(val);
-
     return mp_obj_new_int(value);
   }
 
   case JS_TAG_STRING:
   case JS_TAG_STRING_ROPE:
-
     return quickjs_string_to_mp(ctx, val);
+
+  case JS_TAG_SYMBOL: {
+    JSAtom atom = JS_ValueToAtom(ctx, val);
+    const char *str = JS_AtomToCString(ctx, atom);
+    JS_FreeAtom(ctx, atom);
+    if (str == NULL || str[0] == '\0') {
+      if (str != NULL) {
+        JS_FreeCString(ctx, str);
+      }
+      return mp_obj_new_str("Symbol()", 8);
+    }
+    vstr_t sv;
+    vstr_init(&sv, 32);
+    vstr_add_str(&sv, "Symbol(");
+    vstr_add_str(&sv, str);
+    vstr_add_byte(&sv, ')');
+    JS_FreeCString(ctx, str);
+    return mp_obj_new_str_from_vstr(&sv);
+  }
 
   case JS_TAG_BIG_INT:
   case JS_TAG_SHORT_BIG_INT:
-
     return quickjs_bigint_to_mp(ctx, val);
 
   case JS_TAG_OBJECT: {
-
     if (JS_IsPromise(val)) {
-
       return quickjs_promise_to_mp(ctx, val);
     }
 
     if (JS_IsFunction(ctx, val)) {
-
       return quickjs_function_to_mp(ctx, val);
     }
 
-    if (JS_IsArray(val)) {
+    if (JS_IsDate(val)) {
+      JSValue iso_fn = JS_GetPropertyStr(ctx, val, "toISOString");
+      if (!JS_IsException(iso_fn) && JS_IsFunction(ctx, iso_fn)) {
+        JSValue iso_val = JS_Call(ctx, iso_fn, val, 0, NULL);
+        JS_FreeValue(ctx, iso_fn);
+        if (!JS_IsException(iso_val)) {
+          size_t len = 0;
+          const char *iso_str = JS_ToCStringLen(ctx, &len, iso_val);
+          mp_obj_t result =
+              (iso_str != NULL) ? mp_obj_new_str(iso_str, len) : mp_const_none;
+          if (iso_str != NULL) {
+            JS_FreeCString(ctx, iso_str);
+          }
+          JS_FreeValue(ctx, iso_val);
+          return result;
+        }
+      }
+      JS_FreeValue(ctx, iso_fn);
+      quickjs_clear_pending_exception(ctx);
+    }
 
+    if (JS_IsRegExp(val)) {
+      size_t len = 0;
+      const char *re_str = JS_ToCStringLen(ctx, &len, val);
+      if (re_str != NULL) {
+        mp_obj_t result = mp_obj_new_str(re_str, len);
+        JS_FreeCString(ctx, re_str);
+        return result;
+      }
+      quickjs_clear_pending_exception(ctx);
+    }
+
+    if (JS_IsMap(val)) {
+      return quickjs_map_to_mp(ctx, val, st);
+    }
+
+    if (JS_IsSet(val)) {
+      return quickjs_set_to_mp(ctx, val, st);
+    }
+
+    if (JS_IsArray(val)) {
       return quickjs_array_to_mp(ctx, val, st);
     }
 
     if (JS_IsArrayBuffer(val)) {
-
       return quickjs_arraybuffer_to_mp(ctx, val);
     }
 
@@ -447,7 +644,6 @@ mp_obj_t quickjs_to_mp_obj(JSContext *ctx, JSValueConst val,
       int ta = JS_GetTypedArrayType(val);
 
       if (ta >= 0) {
-
         return quickjs_typedarray_to_mp(ctx, val);
       }
     }

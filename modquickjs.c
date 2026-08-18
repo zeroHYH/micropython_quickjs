@@ -47,6 +47,7 @@ static mp_obj_t mod_quickjs_init(void) {
   }
 
   quickjs_init_console(ctx);
+  quickjs_init_web_apis(ctx);
 
   return mp_const_none;
 }
@@ -325,6 +326,15 @@ static MP_DEFINE_CONST_FUN_OBJ_0(mod_quickjs_help_obj, mod_quickjs_help);
 /* Module globals                                                             */
 /* -------------------------------------------------------------------------- */
 
+mp_obj_t mod_quickjs_eval_json(mp_obj_t json_str_obj) {
+  size_t len = 0;
+  const char *str = mp_obj_str_get_data(json_str_obj, &len);
+  return quickjs_eval_json_helper(NULL, str, len);
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_1(mod_quickjs_eval_json_obj,
+                                 mod_quickjs_eval_json);
+
 static const mp_rom_map_elem_t quickjs_module_globals_table[] = {
 
     {MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_quickjs)},
@@ -334,6 +344,8 @@ static const mp_rom_map_elem_t quickjs_module_globals_table[] = {
     {MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&mod_quickjs_init_obj)},
 
     {MP_ROM_QSTR(MP_QSTR_eval), MP_ROM_PTR(&mod_quickjs_eval_obj)},
+
+    {MP_ROM_QSTR(MP_QSTR_eval_json), MP_ROM_PTR(&mod_quickjs_eval_json_obj)},
 
     {MP_ROM_QSTR(MP_QSTR_call), MP_ROM_PTR(&mod_quickjs_call_obj)},
 

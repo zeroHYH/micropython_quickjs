@@ -302,7 +302,38 @@ expect_raise(
     "custom class",
 )
 
-ctx.close()
 print("Error formatting & stack traces OK")
+
+# =============================================================
+# 6. Special Built-in Objects (Symbol, Date, RegExp, Map, Set)
+# =============================================================
+# Symbol
+assert ctx.eval("Symbol('myKey')") == "Symbol(myKey)"
+assert ctx.eval("Symbol()") == "Symbol()"
+
+# Date -> ISO 8601 string
+date_str = ctx.eval("new Date('2026-08-18T12:00:00Z')")
+assert date_str == "2026-08-18T12:00:00.000Z", f"Got {date_str}"
+
+# RegExp -> string pattern representation
+re_str = ctx.eval("/^[a-z0-9_]+$/gi")
+assert re_str == "/^[a-z0-9_]+$/gi", f"Got {re_str}"
+
+# Map -> Python dict
+map_res = ctx.eval("new Map([['name', 'quickjs'], ['ver', 2026]])")
+assert isinstance(map_res, dict)
+assert map_res == {"name": "quickjs", "ver": 2026}
+
+# Nested Map
+nested_map = ctx.eval("new Map([['inner', new Map([['a', 10], ['b', 20]])]])")
+assert nested_map == {"inner": {"a": 10, "b": 20}}
+
+# Set -> Python set
+set_res = ctx.eval("new Set([1, 2, 3, 2, 1])")
+assert isinstance(set_res, set)
+assert set_res == {1, 2, 3}
+
+ctx.close()
+print("Special built-in objects (Symbol, Date, RegExp, Map, Set) OK")
 
 print("ALL TYPE CONVERSION TESTS PASSED")

@@ -57,6 +57,7 @@ mp_obj_t quickjs_context_make_new(const mp_obj_type_t *type, size_t n_args,
     JS_SetModuleLoaderFunc(qrt, NULL, quickjs_module_loader_cb, state);
 
     quickjs_init_console(qctx);
+    quickjs_init_web_apis(qctx);
 
     self = MP_OBJ_FROM_PTR(obj);
 
@@ -691,11 +692,24 @@ static MP_DEFINE_CONST_FUN_OBJ_1(mod_quickjs_ctx_repl_obj,
 static MP_DEFINE_CONST_FUN_OBJ_1(mod_quickjs_ctx_close_obj,
                                  mod_quickjs_ctx_close);
 
+mp_obj_t mod_quickjs_ctx_eval_json(mp_obj_t self_in, mp_obj_t json_str_obj) {
+  quickjs_ctx_t *state = quickjs_ctx_check_open(self_in);
+  size_t len = 0;
+  const char *str = mp_obj_str_get_data(json_str_obj, &len);
+  return quickjs_eval_json_helper(state, str, len);
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_2(mod_quickjs_ctx_eval_json_obj,
+                                 mod_quickjs_ctx_eval_json);
+
 static const mp_rom_map_elem_t quickjs_context_locals_dict_table[] = {
 
     {MP_ROM_QSTR(MP_QSTR___del__), MP_ROM_PTR(&mod_quickjs_ctx_close_obj)},
 
     {MP_ROM_QSTR(MP_QSTR_eval), MP_ROM_PTR(&mod_quickjs_ctx_eval_obj)},
+
+    {MP_ROM_QSTR(MP_QSTR_eval_json),
+     MP_ROM_PTR(&mod_quickjs_ctx_eval_json_obj)},
 
     {MP_ROM_QSTR(MP_QSTR_call), MP_ROM_PTR(&mod_quickjs_ctx_call_obj)},
 

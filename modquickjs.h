@@ -308,6 +308,13 @@ mp_obj_t mod_quickjs_ctx_eval_module(size_t n_args, const mp_obj_t *args);
 mp_obj_t mod_quickjs_ctx_set_module_loader(mp_obj_t self_in,
                                            mp_obj_t loader_obj);
 mp_obj_t mod_quickjs_ctx_repl(mp_obj_t self_in);
+mp_obj_t mod_quickjs_ctx_eval_json(mp_obj_t self_in, mp_obj_t json_str_obj);
+
+/* qjs_web.c */
+void quickjs_init_web_apis(JSContext *ctx);
+mp_obj_t quickjs_eval_json_helper(quickjs_ctx_t *state, const char *json_str,
+                                  size_t len);
+mp_obj_t mod_quickjs_eval_json(mp_obj_t json_str_obj);
 
 /* qjs_module.c */
 JSModuleDef *quickjs_module_loader_cb(JSContext *ctx, const char *module_name,

@@ -12,6 +12,7 @@ test_modules = [
     "test_bytecode",
     "test_module",
     "test_console",
+    "test_web",
     "test_asyncio",
     "test_lifecycle",
 ]

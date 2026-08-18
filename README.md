@@ -514,6 +514,11 @@ was closed raises `context closed`.
 | `boolean` | `bool` |
 | `number` | `int` (integral) or `float` |
 | `string` | `str` |
+| `Symbol` | `str` (e.g. `"Symbol(id)"` or `"Symbol()"`) |
+| `Date` | `str` (ISO 8601 formatted, e.g. `"2026-08-18T12:00:00.000Z"`) |
+| `RegExp` | `str` (e.g. `"/pattern/flags"`) |
+| `Map` (ES6) | `dict` (recursive key-value mapping) |
+| `Set` (ES6) | `set` (Python set of unique elements) |
 | `Array` | `list` |
 | `Object` | `dict` |
 | `ArrayBuffer` | `bytes` |
@@ -642,6 +647,46 @@ globalThis.calc = mul(6, 7);
 """)
 assert ctx.get("calc") == 42
 
+### Built-in Web APIs (`TextEncoder`, `TextDecoder`, `btoa`, `atob`, `performance.now`)
+
+Web standard utility APIs are available out of the box in all JavaScript environments:
+
+```javascript
+// 1. TextEncoder & TextDecoder (UTF-8 bytes <-> string)
+const enc = new TextEncoder();
+const bytes = enc.encode("Hello 🌍");  // -> Uint8Array
+const dec = new TextDecoder();
+const text = dec.decode(bytes);        // -> "Hello 🌍"
+
+// 2. btoa & atob (Base64 encoding / decoding)
+const b64 = btoa("admin:secret");      // -> "YWRtaW46c2VjcmV0"
+const orig = atob(b64);                 // -> "admin:secret"
+
+// 3. performance.now() (high-resolution microsecond timer)
+const t0 = performance.now();
+// ... computation ...
+const elapsed = performance.now() - t0;
+```
+
+### Fast JSON Evaluation (`eval_json`)
+
+Direct C-level JSON parser bypassing standard JavaScript AST parsing and object allocation:
+
+```python
+import quickjs
+
+ctx = quickjs.Context()
+
+# Parse JSON directly via C engine:
+data = ctx.eval_json('{"sensor": "DHT22", "values": [23.5, 24.1], "active": true}')
+assert data["sensor"] == "DHT22"
+assert data["values"] == [23.5, 24.1]
+
+# Module singleton:
+res = quickjs.eval_json('{"status": 200, "message": "OK"}')
+assert res == {"status": 200, "message": "OK"}
+```
+
 ### Built-in `console` Object
 
 A standard `console` object is built-in and automatically available in every JavaScript context (including the REPL):
@@ -725,12 +770,13 @@ micropython tests/run_all.py
 
 # Or run individual functional test modules:
 micropython tests/test_basic.py        # module singleton & Context basics, timeouts
-micropython tests/test_convert.py      # type conversions, BigInt, TypedArray, safety
+micropython tests/test_convert.py      # type conversions, BigInt, TypedArray, safety, Symbol, Date, RegExp, Map, Set
 micropython tests/test_function.py     # function wrappers, callbacks, reentrancy
 micropython tests/test_promise.py      # promises, async/await, unhandled rejection tracker
 micropython tests/test_bytecode.py     # bytecode compilation, execution, cross-context sharing
 micropython tests/test_module.py       # ES module evaluation, Python loader, VFS import
 micropython tests/test_console.py      # built-in console logging and formatting
+micropython tests/test_web.py          # Web standard APIs (TextEncoder/Decoder, btoa/atob, performance) & fast JSON
 micropython tests/test_asyncio.py      # asyncio event loop cooperative promise waiting
 micropython tests/test_lifecycle.py    # lifecycle, multiple contexts, OOM & stress
 ```
@@ -748,18 +794,17 @@ qjs_exec.c            execution engine, bytecode helpers, timeout interrupt & jo
 qjs_module.c          ES module evaluation, VFS bridge & custom Python loader callback
 qjs_repl.c            built-in interactive C REPL via shared/readline
 qjs_console.c         built-in console object (log, warn, error, info, debug)
-qjs_convert.c         bidirectional JS <-> MicroPython type conversion
+qjs_web.c             Web standard APIs (TextEncoder/Decoder, btoa/atob, performance) & fast JSON
+qjs_convert.c         bidirectional JS <-> MicroPython type conversion (incl. Symbol, Date, RegExp, Map, Set)
 qjs_error.c           unified error handling & exception formatting
 qjs_callback.c        Python callable -> JS CClosure callback registry
 qjs_promise.c         Promise wrapper, then/catch/finally_ chaining & resolver
 qjs_func.c            Function wrapper, call/this binding & pass-through
 qjs_bigint.c          arbitrary precision BigInt marker & conversions
-tests/                functional test suites (test_basic, test_convert, test_function, test_promise, test_bytecode, test_module, test_console, test_asyncio, test_lifecycle, run_all.py)
+tests/                functional test suites (test_basic, test_convert, test_function, test_promise, test_bytecode, test_module, test_console, test_web, test_asyncio, test_lifecycle, run_all.py)
 src/                  generated: QuickJS-NG fetched from GitHub (git-ignored)
 ```
 
 ## License
 
 MIT (QuickJS-NG is MIT).
-
-
