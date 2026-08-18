@@ -26,7 +26,9 @@ SRC_USERMOD_C += \
     $(QJS_MOD_DIR)/qjs_func.c \
     $(QJS_MOD_DIR)/qjs_promise.c \
     $(QJS_MOD_DIR)/qjs_bigint.c \
-    $(QJS_MOD_DIR)/qjs_context.c
+    $(QJS_MOD_DIR)/qjs_context.c \
+    $(QJS_MOD_DIR)/qjs_module.c \
+    $(QJS_MOD_DIR)/qjs_repl.c
 
 # QuickJS-NG engine sources.  Kept out of SRC_USERMOD_C so the QSTR scanner
 # does not process vendored third-party code.

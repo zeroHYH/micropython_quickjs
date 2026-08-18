@@ -592,6 +592,82 @@ stack:
   Partially built arguments/containers are released on all such paths, so
   the Context closes cleanly afterwards.
 
+### Bytecode Compilation & Execution
+
+QuickJS allows compiling JavaScript source code into compact binary bytecode (`bytes`) and evaluating it directly without parsing overhead.
+
+```python
+import quickjs
+
+# 1. Compile JS code into binary bytecode (bytes)
+bc = quickjs.compile_bytecode("function add(a, b) { return a + b; }; add(10, 20);")
+assert isinstance(bc, bytes)
+
+# 2. Execute precompiled bytecode directly on singleton or any Context
+result = quickjs.eval_bytecode(bc)  # -> 30
+
+# Context-level methods:
+ctx = quickjs.Context()
+ctx_bc = ctx.compile_bytecode("globalThis.answer = 42;")
+ctx.eval_bytecode(ctx_bc)
+assert ctx.get("answer") == 42
+```
+
+### ES Modules & Module Loaders
+
+Execute ES modules with `export` / `import` syntax. The module loader automatically resolves imports from MicroPython's Virtual File System (VFS), or uses a custom Python loader callback.
+
+```python
+ctx = quickjs.Context()
+
+# 1. Direct ES module evaluation
+ctx.eval_module("""
+export const VALUE = 42;
+export function double(x) { return x * 2; }
+globalThis.ans = double(VALUE);
+""")
+assert ctx.get("ans") == 84
+
+# 2. Custom Python Module Loader (virtual modules)
+def my_loader(module_name):
+    if module_name == "virtual:math":
+        return "export function mul(a, b) { return a * b; }"
+    return None  # Fallback to VFS file lookup
+
+ctx.set_module_loader(my_loader)
+
+ctx.eval_module("""
+import { mul } from 'virtual:math';
+globalThis.calc = mul(6, 7);
+""")
+assert ctx.get("calc") == 42
+
+# 3. VFS File Loading (loads ./utils.js from filesystem)
+# import { helper } from './utils.js';
+```
+
+### Interactive C-level REPL
+
+A built-in interactive JavaScript REPL powered by MicroPython's native readline engine:
+
+```python
+import quickjs
+
+# Launch REPL with singleton context:
+quickjs.repl()
+
+# Or launch REPL on an existing Context:
+ctx = quickjs.Context()
+ctx.set("initVal", 100)
+ctx.repl()
+```
+
+- **Features**:
+  - Native line editing, history, and arrow key support via MicroPython's `readline`.
+  - Multiline statement detection: unclosed `{`, `(`, `[`, template literals, and strings automatically prompt with `... `.
+  - Async Promise evaluation: automatically runs microtask jobs (`run_jobs()`) and formats `Promise { <fulfilled>: ... }`.
+  - Dot commands: `.help`, `.clear`, `.mem` (view JS heap bytes), `.gc`, `.exit` (or press `Ctrl+D`).
+
 ## Tests
 
 Run with the built unix `micropython` binary:
@@ -605,6 +681,8 @@ micropython tests/test_basic.py        # module singleton & Context basics, time
 micropython tests/test_convert.py      # type conversions, BigInt, TypedArray, safety
 micropython tests/test_function.py     # function wrappers, callbacks, reentrancy
 micropython tests/test_promise.py      # promises, async/await, unhandled rejection tracker
+micropython tests/test_bytecode.py     # bytecode compilation, execution, cross-context sharing
+micropython tests/test_module.py       # ES module evaluation, Python loader, VFS import
 micropython tests/test_lifecycle.py    # lifecycle, multiple contexts, OOM & stress
 ```
 
@@ -617,17 +695,20 @@ get_quickjs.sh        fetch the QuickJS-NG engine into src/ (from GitHub)
 modquickjs.h          unified header: structs, macros, cross-module prototypes
 modquickjs.c          module registration & singleton API entry points
 qjs_context.c         quickjs.Context() instance management & methods
-qjs_exec.c            execution engine, timeout interrupt & job queue helper
+qjs_exec.c            execution engine, bytecode helpers, timeout interrupt & job queue
+qjs_module.c          ES module evaluation, VFS bridge & custom Python loader callback
+qjs_repl.c            built-in interactive C REPL via shared/readline
 qjs_convert.c         bidirectional JS <-> MicroPython type conversion
 qjs_error.c           unified error handling & exception formatting
 qjs_callback.c        Python callable -> JS CClosure callback registry
 qjs_promise.c         Promise wrapper, then/catch/finally_ chaining & resolver
 qjs_func.c            Function wrapper, call/this binding & pass-through
 qjs_bigint.c          arbitrary precision BigInt marker & conversions
-tests/                functional test suites (test_basic, test_convert, test_function, test_promise, test_lifecycle, run_all.py)
+tests/                functional test suites (test_basic, test_convert, test_function, test_promise, test_bytecode, test_module, test_lifecycle, run_all.py)
 src/                  generated: QuickJS-NG fetched from GitHub (git-ignored)
 ```
 
 ## License
 
 MIT (QuickJS-NG is MIT).
+

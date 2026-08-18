@@ -26,6 +26,8 @@ target_sources(usermod_quickjs INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/qjs_promise.c
     ${CMAKE_CURRENT_LIST_DIR}/qjs_bigint.c
     ${CMAKE_CURRENT_LIST_DIR}/qjs_context.c
+    ${CMAKE_CURRENT_LIST_DIR}/qjs_module.c
+    ${CMAKE_CURRENT_LIST_DIR}/qjs_repl.c
     ${CMAKE_CURRENT_LIST_DIR}/src/quickjs.c
     ${CMAKE_CURRENT_LIST_DIR}/src/libregexp.c
     ${CMAKE_CURRENT_LIST_DIR}/src/libunicode.c

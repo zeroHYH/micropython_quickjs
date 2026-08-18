@@ -100,6 +100,7 @@ struct _quickjs_ctx_t {
   struct _quickjs_value_entry_t *resolver_entries;
   uint32_t next_token;
   quickjs_rejection_handler_t *rejection_handler;
+  mp_obj_t module_loader;
 };
 
 typedef struct _mp_obj_quickjs_context_t {
@@ -298,5 +299,30 @@ mp_obj_t mod_quickjs_ctx_has_pending_jobs(mp_obj_t self_in);
 mp_obj_t mod_quickjs_ctx_set_memory_limit(mp_obj_t self_in, mp_obj_t limit_obj);
 mp_obj_t mod_quickjs_ctx_set_max_stack_size(mp_obj_t self_in,
                                             mp_obj_t limit_obj);
+mp_obj_t mod_quickjs_ctx_compile_bytecode(size_t n_args, const mp_obj_t *args);
+mp_obj_t mod_quickjs_ctx_eval_bytecode(mp_obj_t self_in, mp_obj_t bytes_obj);
+mp_obj_t mod_quickjs_ctx_eval_module(size_t n_args, const mp_obj_t *args);
+mp_obj_t mod_quickjs_ctx_set_module_loader(mp_obj_t self_in,
+                                           mp_obj_t loader_obj);
+mp_obj_t mod_quickjs_ctx_repl(mp_obj_t self_in);
+
+/* qjs_module.c */
+JSModuleDef *quickjs_module_loader_cb(JSContext *ctx, const char *module_name,
+                                      void *opaque);
+mp_obj_t quickjs_eval_module_helper(quickjs_ctx_t *state, const char *js_code,
+                                    size_t len, const char *filename);
+
+/* qjs_repl.c */
+void quickjs_repl_run(quickjs_ctx_t *state);
+mp_obj_t mod_quickjs_repl(void);
+
+/* Bytecode helpers */
+mp_obj_t quickjs_compile_bytecode_helper(quickjs_ctx_t *state, const char *code,
+                                         size_t len, const char *filename,
+                                         bool is_module);
+mp_obj_t quickjs_eval_bytecode_helper(quickjs_ctx_t *state, const uint8_t *buf,
+                                      size_t len);
+mp_obj_t mod_quickjs_compile_bytecode(size_t n_args, const mp_obj_t *args);
+mp_obj_t mod_quickjs_eval_bytecode(mp_obj_t bytes_obj);
 
 #endif // MICROPY_INCLUDED_MODQUICKJS_H

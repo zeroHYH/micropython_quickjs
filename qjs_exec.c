@@ -382,3 +382,83 @@ mp_obj_t quickjs_call_helper(quickjs_ctx_t *state, const char *function_name,
 
   return mp_const_none; /* unreachable */
 }
+
+/* -------------------------------------------------------------------------- */
+/* Bytecode compilation and execution helpers                                 */
+/* -------------------------------------------------------------------------- */
+
+mp_obj_t quickjs_compile_bytecode_helper(quickjs_ctx_t *state, const char *code,
+                                         size_t len, const char *filename,
+                                         bool is_module) {
+  JSContext *qctx = (state != NULL) ? state->ctx : ctx;
+
+  if (qctx == NULL) {
+    mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("context closed"));
+  }
+
+  int flags = JS_EVAL_FLAG_COMPILE_ONLY |
+              (is_module ? JS_EVAL_TYPE_MODULE : JS_EVAL_TYPE_GLOBAL);
+
+  JSValue obj =
+      JS_Eval(qctx, code, len, (filename != NULL) ? filename : "<eval>", flags);
+
+  if (JS_IsException(obj)) {
+    quickjs_raise_exception(qctx, obj);
+    return mp_const_none;
+  }
+
+  size_t out_len = 0;
+  uint8_t *bytes = JS_WriteObject(qctx, &out_len, obj, JS_WRITE_OBJ_BYTECODE);
+  JS_FreeValue(qctx, obj);
+
+  if (bytes == NULL) {
+    quickjs_raise_exception(qctx, JS_UNDEFINED);
+    return mp_const_none;
+  }
+
+  mp_obj_t ret = mp_obj_new_bytes(bytes, out_len);
+  js_free(qctx, bytes);
+  return ret;
+}
+
+mp_obj_t quickjs_eval_bytecode_helper(quickjs_ctx_t *state, const uint8_t *buf,
+                                      size_t len) {
+  JSContext *qctx = (state != NULL) ? state->ctx : ctx;
+
+  if (qctx == NULL) {
+    mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("context closed"));
+  }
+
+  quickjs_ctx_arm_timeout(state);
+
+  JSValue fun_obj = JS_ReadObject(qctx, buf, len, JS_READ_OBJ_BYTECODE);
+
+  if (JS_IsException(fun_obj)) {
+    bool timed_out = quickjs_ctx_finish_timeout(state);
+    quickjs_raise_exception_state(qctx, fun_obj, timed_out);
+    return mp_const_none;
+  }
+
+  if (JS_ResolveModule(qctx, fun_obj) < 0) {
+    JS_FreeValue(qctx, fun_obj);
+    bool timed_out = quickjs_ctx_finish_timeout(state);
+    quickjs_raise_exception_state(qctx, JS_UNDEFINED, timed_out);
+    return mp_const_none;
+  }
+
+  /* JS_EvalFunction takes ownership of fun_obj and frees it on all paths */
+  JSValue result = JS_EvalFunction(qctx, fun_obj);
+  bool timed_out = quickjs_ctx_finish_timeout(state);
+
+  if (JS_IsException(result)) {
+    quickjs_raise_exception_state(qctx, result, timed_out);
+    return mp_const_none;
+  }
+
+  quickjs_convert_state_t st;
+  memset(&st, 0, sizeof(st));
+
+  mp_obj_t mp_result = quickjs_to_mp_owned(qctx, result, result, &st);
+  JS_FreeValue(qctx, result);
+  return mp_result;
+}

@@ -9,6 +9,8 @@ test_modules = [
     "test_convert",
     "test_function",
     "test_promise",
+    "test_bytecode",
+    "test_module",
     "test_lifecycle",
 ]
 

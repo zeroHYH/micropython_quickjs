@@ -49,10 +49,12 @@ mp_obj_t quickjs_context_make_new(const mp_obj_type_t *type, size_t n_args,
     state->ctx = qctx;
     state->closed = false;
     state->self_obj = MP_OBJ_FROM_PTR(obj);
+    state->module_loader = MP_OBJ_NULL;
 
     JS_SetContextOpaque(qctx, state);
 
     JS_SetInterruptHandler(qrt, quickjs_interrupt_handler, state);
+    JS_SetModuleLoaderFunc(qrt, NULL, quickjs_module_loader_cb, state);
 
     self = MP_OBJ_FROM_PTR(obj);
 
@@ -586,6 +588,100 @@ mp_obj_t mod_quickjs_ctx_set_max_stack_size(mp_obj_t self_in,
 static MP_DEFINE_CONST_FUN_OBJ_2(mod_quickjs_ctx_set_max_stack_size_obj,
                                  mod_quickjs_ctx_set_max_stack_size);
 
+mp_obj_t mod_quickjs_ctx_compile_bytecode(size_t n_args, const mp_obj_t *args) {
+  quickjs_ctx_t *state = quickjs_ctx_check_open(args[0]);
+  size_t len = 0;
+  const char *code = mp_obj_str_get_data(args[1], &len);
+  const char *filename = (n_args > 2) ? mp_obj_str_get_str(args[2]) : "<eval>";
+  bool is_module = (n_args > 3) ? mp_obj_is_true(args[3]) : false;
+
+  return quickjs_compile_bytecode_helper(state, code, len, filename, is_module);
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(mod_quickjs_ctx_compile_bytecode_obj,
+                                           2, 4,
+                                           mod_quickjs_ctx_compile_bytecode);
+
+mp_obj_t mod_quickjs_ctx_eval_bytecode(mp_obj_t self_in, mp_obj_t bytes_obj) {
+  quickjs_ctx_t *state = quickjs_ctx_check_open(self_in);
+
+  mp_buffer_info_t bufinfo;
+  mp_get_buffer_raise(bytes_obj, &bufinfo, MP_BUFFER_READ);
+
+  quickjs_ctx_enter(state);
+
+  nlr_buf_t nlr;
+  if (nlr_push(&nlr) == 0) {
+    mp_obj_t res = quickjs_eval_bytecode_helper(
+        state, (const uint8_t *)bufinfo.buf, bufinfo.len);
+    nlr_pop();
+    quickjs_ctx_leave(state);
+    return res;
+  } else {
+    quickjs_ctx_leave(state);
+    nlr_raise(nlr.ret_val);
+  }
+
+  return mp_const_none;
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_2(mod_quickjs_ctx_eval_bytecode_obj,
+                                 mod_quickjs_ctx_eval_bytecode);
+
+mp_obj_t mod_quickjs_ctx_eval_module(size_t n_args, const mp_obj_t *args) {
+  quickjs_ctx_t *state = quickjs_ctx_check_open(args[0]);
+  size_t len = 0;
+  const char *code = mp_obj_str_get_data(args[1], &len);
+  const char *filename =
+      (n_args > 2) ? mp_obj_str_get_str(args[2]) : "<module>";
+
+  quickjs_ctx_enter(state);
+
+  nlr_buf_t nlr;
+  if (nlr_push(&nlr) == 0) {
+    mp_obj_t res = quickjs_eval_module_helper(state, code, len, filename);
+    nlr_pop();
+    quickjs_ctx_leave(state);
+    return res;
+  } else {
+    quickjs_ctx_leave(state);
+    nlr_raise(nlr.ret_val);
+  }
+
+  return mp_const_none;
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(mod_quickjs_ctx_eval_module_obj, 2,
+                                           3, mod_quickjs_ctx_eval_module);
+
+mp_obj_t mod_quickjs_ctx_set_module_loader(mp_obj_t self_in,
+                                           mp_obj_t loader_obj) {
+  quickjs_ctx_t *state = quickjs_ctx_check_open(self_in);
+
+  if (loader_obj == mp_const_none) {
+    state->module_loader = MP_OBJ_NULL;
+  } else if (mp_obj_is_callable(loader_obj)) {
+    state->module_loader = loader_obj;
+  } else {
+    mp_raise_msg(&mp_type_TypeError,
+                 MP_ERROR_TEXT("module loader must be callable or None"));
+  }
+
+  return mp_const_none;
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_2(mod_quickjs_ctx_set_module_loader_obj,
+                                 mod_quickjs_ctx_set_module_loader);
+
+mp_obj_t mod_quickjs_ctx_repl(mp_obj_t self_in) {
+  quickjs_ctx_t *state = quickjs_ctx_check_open(self_in);
+  quickjs_repl_run(state);
+  return mp_const_none;
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_1(mod_quickjs_ctx_repl_obj,
+                                 mod_quickjs_ctx_repl);
+
 /* -------------------------------------------------------------------------- */
 /* Context type definition                                                    */
 /* -------------------------------------------------------------------------- */
@@ -632,6 +728,20 @@ static const mp_rom_map_elem_t quickjs_context_locals_dict_table[] = {
 
     {MP_ROM_QSTR(MP_QSTR_set_max_stack_size),
      MP_ROM_PTR(&mod_quickjs_ctx_set_max_stack_size_obj)},
+
+    {MP_ROM_QSTR(MP_QSTR_compile_bytecode),
+     MP_ROM_PTR(&mod_quickjs_ctx_compile_bytecode_obj)},
+
+    {MP_ROM_QSTR(MP_QSTR_eval_bytecode),
+     MP_ROM_PTR(&mod_quickjs_ctx_eval_bytecode_obj)},
+
+    {MP_ROM_QSTR(MP_QSTR_eval_module),
+     MP_ROM_PTR(&mod_quickjs_ctx_eval_module_obj)},
+
+    {MP_ROM_QSTR(MP_QSTR_set_module_loader),
+     MP_ROM_PTR(&mod_quickjs_ctx_set_module_loader_obj)},
+
+    {MP_ROM_QSTR(MP_QSTR_repl), MP_ROM_PTR(&mod_quickjs_ctx_repl_obj)},
 };
 
 static MP_DEFINE_CONST_DICT(quickjs_context_locals_dict,

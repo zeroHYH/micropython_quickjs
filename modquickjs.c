@@ -32,6 +32,8 @@ static mp_obj_t mod_quickjs_init(void) {
    */
   JS_SetMemoryLimit(rt, QUICKJS_DEFAULT_MEMORY_LIMIT);
 
+  JS_SetModuleLoaderFunc(rt, NULL, quickjs_module_loader_cb, NULL);
+
   ctx = JS_NewContext(rt);
 
   if (ctx == NULL) {
@@ -129,6 +131,57 @@ static MP_DEFINE_CONST_FUN_OBJ_0(mod_quickjs_has_pending_jobs_obj,
                                  mod_quickjs_has_pending_jobs);
 
 /* -------------------------------------------------------------------------- */
+/* quickjs.compile_bytecode() / eval_bytecode() / repl()                      */
+/* -------------------------------------------------------------------------- */
+
+mp_obj_t mod_quickjs_compile_bytecode(size_t n_args, const mp_obj_t *args) {
+  if (ctx == NULL) {
+    mod_quickjs_init();
+  }
+
+  size_t len = 0;
+  const char *code = mp_obj_str_get_data(args[0], &len);
+  const char *filename = (n_args > 1) ? mp_obj_str_get_str(args[1]) : "<eval>";
+  bool is_module = (n_args > 2) ? mp_obj_is_true(args[2]) : false;
+
+  return quickjs_compile_bytecode_helper(NULL, code, len, filename, is_module);
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(mod_quickjs_compile_bytecode_obj, 1,
+                                           3, mod_quickjs_compile_bytecode);
+
+mp_obj_t mod_quickjs_eval_bytecode(mp_obj_t bytes_obj) {
+  if (ctx == NULL) {
+    mod_quickjs_init();
+  }
+
+  mp_buffer_info_t bufinfo;
+  mp_get_buffer_raise(bytes_obj, &bufinfo, MP_BUFFER_READ);
+
+  return quickjs_eval_bytecode_helper(NULL, (const uint8_t *)bufinfo.buf,
+                                      bufinfo.len);
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_1(mod_quickjs_eval_bytecode_obj,
+                                 mod_quickjs_eval_bytecode);
+
+mp_obj_t mod_quickjs_repl(void) {
+  if (ctx == NULL) {
+    mod_quickjs_init();
+  }
+
+  quickjs_ctx_t state;
+  memset(&state, 0, sizeof(state));
+  state.rt = rt;
+  state.ctx = ctx;
+
+  quickjs_repl_run(&state);
+  return mp_const_none;
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_0(mod_quickjs_repl_obj, mod_quickjs_repl);
+
+/* -------------------------------------------------------------------------- */
 /* quickjs.help()                                                             */
 /* -------------------------------------------------------------------------- */
 
@@ -150,6 +203,12 @@ static mp_obj_t mod_quickjs_help(void) {
       "      Execute pending JS jobs (promise microtasks); returns count\n"
       "  quickjs.has_pending_jobs()\n"
       "      True if there are unexecuted JS jobs\n"
+      "  quickjs.compile_bytecode(code, filename='<eval>', is_module=False)\n"
+      "      Compile JS code into compact binary bytecode (bytes)\n"
+      "  quickjs.eval_bytecode(bytes)\n"
+      "      Execute precompiled JS bytecode directly\n"
+      "  quickjs.repl()\n"
+      "      Start interactive JavaScript REPL\n"
       "  quickjs.version()\n"
       "      Return QuickJS-NG engine version\n"
       "  quickjs.help()\n"
@@ -160,6 +219,16 @@ static mp_obj_t mod_quickjs_help(void) {
       "      Create an independent JS runtime + context\n"
       "  ctx.eval(code)\n"
       "      Execute JavaScript code\n"
+      "  ctx.eval_module(code, filename='<module>')\n"
+      "      Execute an ES Module with export/import\n"
+      "  ctx.set_module_loader(callable_or_None)\n"
+      "      Set custom Python module loader for import statements\n"
+      "  ctx.compile_bytecode(code, filename='<eval>', is_module=False)\n"
+      "      Compile JS code into bytecode\n"
+      "  ctx.eval_bytecode(bytes)\n"
+      "      Execute precompiled bytecode\n"
+      "  ctx.repl()\n"
+      "      Start interactive REPL on this context\n"
       "  ctx.call(name, *args)\n"
       "      Call a global JavaScript function\n"
       "  ctx.get(name)\n"
@@ -233,14 +302,16 @@ static mp_obj_t mod_quickjs_help(void) {
       "  callable  -> Function (via add_callable)\n"
       "  bigint()  -> BigInt\n"
       "\n"
-      "Example:\n"
+      "Examples:\n"
       "  >>> import quickjs\n"
-      "  >>> quickjs.init()\n"
-      "  >>> quickjs.eval('function add(a,b) { return a+b; }')\n"
+      "  >>> quickjs.eval('1 + 2')\n"
+      "  3\n"
+      "  >>> quickjs.eval('function add(a, b) { return a + b; }')\n"
       "  >>> quickjs.call('add', 10, 20)\n"
       "  30\n"
-      "  >>> quickjs.eval('function f(x) { return {value:x*2}; }')\n"
-      "  >>> quickjs.call('f', {'x': 10})\n"
+      "  >>> bc = quickjs.compile_bytecode('2 + 3')\n"
+      "  >>> quickjs.eval_bytecode(bc)\n"
+      "  5\n"
       "\n");
 
   return mp_const_none;
@@ -268,6 +339,14 @@ static const mp_rom_map_elem_t quickjs_module_globals_table[] = {
 
     {MP_ROM_QSTR(MP_QSTR_has_pending_jobs),
      MP_ROM_PTR(&mod_quickjs_has_pending_jobs_obj)},
+
+    {MP_ROM_QSTR(MP_QSTR_compile_bytecode),
+     MP_ROM_PTR(&mod_quickjs_compile_bytecode_obj)},
+
+    {MP_ROM_QSTR(MP_QSTR_eval_bytecode),
+     MP_ROM_PTR(&mod_quickjs_eval_bytecode_obj)},
+
+    {MP_ROM_QSTR(MP_QSTR_repl), MP_ROM_PTR(&mod_quickjs_repl_obj)},
 
     {MP_ROM_QSTR(MP_QSTR_version), MP_ROM_PTR(&mod_quickjs_version_obj)},
 
